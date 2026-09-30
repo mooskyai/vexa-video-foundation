@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-import torch
+from typing import cast
+
 from torch import Tensor, nn
 
 
@@ -20,7 +21,7 @@ class Residual3DBlock(nn.Module):
         )
 
     def forward(self, x: Tensor) -> Tensor:
-        return x + self.net(x)
+        return x + cast(Tensor, self.net(x))
 
 
 class TinyVideoVAE(nn.Module):
@@ -30,7 +31,9 @@ class TinyVideoVAE(nn.Module):
     posterior (mu/logvar + KL objective) is introduced in the dedicated VAE milestone.
     """
 
-    def __init__(self, in_channels: int = 3, latent_channels: int = 4, base_channels: int = 16) -> None:
+    def __init__(
+        self, in_channels: int = 3, latent_channels: int = 4, base_channels: int = 16
+    ) -> None:
         super().__init__()
         self.encoder = nn.Sequential(
             nn.Conv3d(in_channels, base_channels, kernel_size=3, padding=1),
@@ -75,12 +78,12 @@ class TinyVideoVAE(nn.Module):
 
     def encode(self, video: Tensor) -> Tensor:
         self._validate(video)
-        return self.encoder(video)
+        return cast(Tensor, self.encoder(video))
 
     def decode(self, latents: Tensor) -> Tensor:
         if latents.ndim != 5:
             raise ValueError(f"latents must be [B, C, T, H, W], got {tuple(latents.shape)}")
-        return self.decoder(latents)
+        return cast(Tensor, self.decoder(latents))
 
     def forward(self, video: Tensor) -> tuple[Tensor, Tensor]:
         latents = self.encode(video)

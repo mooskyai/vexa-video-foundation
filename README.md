@@ -18,14 +18,14 @@ The long-term capability target is the class of workflows publicly demonstrated 
 
 The starter kit contains executable skeletons for:
 
-- deterministic synthetic video generation;
+- deterministic synthetic video generation with balanced cardinal direction/color controls;
 - a tiny from-scratch byte tokenizer;
 - a trainable Transformer text encoder;
 - a 3D convolutional Video VAE;
 - a latent Video DiT with temporal/spatial patching;
 - a DDPM-style noise schedule;
 - training utilities and checkpoint format;
-- a CLI smoke test;
+- a CLI smoke test and M1 supervised motion-sanity probe;
 - CPU unit tests that validate shapes, determinism, gradients, and diffusion math;
 - architecture and scaling plans through the frontier-capability milestones.
 
@@ -93,6 +93,21 @@ Generate a deterministic synthetic training clip as a tensor checkpoint:
 ```powershell
 uv run vexa-video synth --output outputs/sample.pt --frames 16 --size 64 --seed 42
 ```
+
+## M1 — Synthetic motion sanity gate
+
+M1 begins without changing the starter architecture. The first stage expands the deterministic synthetic renderer to balanced right/left/down/up motion, red/green/blue/yellow appearance, square/circle shapes and slow/medium/fast motion with disjoint train/validation/test seed spaces. Before generative training, a small supervised 3D-convolutional probe must prove that direction and color are recoverable from the rendered video signal.
+
+Run the M1 probe on the development GPU:
+
+```powershell
+uv run vexa-video m1-probe `
+  --config configs/tiny.toml `
+  --run-dir runs/m1-probe `
+  --cuda
+```
+
+The frozen Stage-A gate in `configs/tiny.toml` requires both direction and color accuracy >= 0.95 on the held-out test seed space. Passing this probe does **not** complete M1; it only authorizes the next M1 step: generative temporal training and evaluation using the existing VAE/DiT/diffusion starter stack.
 
 ## Development checks
 

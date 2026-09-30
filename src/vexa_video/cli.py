@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import platform
 from dataclasses import asdict
 from pathlib import Path
-import platform
 
 import torch
 
@@ -11,6 +11,7 @@ from vexa_video.config import load_config
 from vexa_video.data.synthetic import render_moving_square
 from vexa_video.diffusion import LinearNoiseSchedule
 from vexa_video.models import ByteTokenizer, TinyVideoVAE, TransformerTextEncoder, VideoDiT
+from vexa_video.training import train_m1_probe
 from vexa_video.utils.seed import seed_everything
 
 
@@ -75,7 +76,7 @@ def cmd_smoke(args: argparse.Namespace) -> int:
     noisy = schedule.add_noise(latents, noise, timestep)
     predicted = dit(noisy, timestep, text, tokens.attention_mask)
     loss = torch.nn.functional.mse_loss(predicted, noise)
-    loss.backward()
+    torch.autograd.backward(loss)
 
     print(f"device={device}")
     print(f"config={asdict(cfg)}")
@@ -109,6 +110,28 @@ def cmd_synth(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_m1_probe(args: argparse.Namespace) -> int:
+    cfg = load_config(args.config)
+    seed_everything(cfg.seed)
+    if args.cuda and not torch.cuda.is_available():
+        raise RuntimeError("--cuda requested but CUDA is not available")
+    device = torch.device("cuda" if args.cuda else "cpu")
+    result = train_m1_probe(
+        cfg,
+        device=device,
+        run_dir=args.run_dir,
+        steps=args.steps,
+    )
+    print(f"device={device}")
+    print(f"baseline_direction_accuracy={result.baseline_direction_accuracy:.6f}")
+    print(f"baseline_color_accuracy={result.baseline_color_accuracy:.6f}")
+    print(f"direction_accuracy={result.direction_accuracy:.6f}")
+    print(f"color_accuracy={result.color_accuracy:.6f}")
+    print(f"gate_passed={result.gate_passed}")
+    print(f"checkpoint={result.checkpoint}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="vexa-video")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -120,6 +143,16 @@ def build_parser() -> argparse.ArgumentParser:
     smoke.add_argument("--config", default="configs/tiny.toml")
     smoke.add_argument("--cuda", action="store_true", help="Use CUDA when available")
     smoke.set_defaults(func=cmd_smoke)
+
+    m1_probe = sub.add_parser(
+        "m1-probe",
+        help="Train the supervised M1 temporal/color sanity probe",
+    )
+    m1_probe.add_argument("--config", default="configs/tiny.toml")
+    m1_probe.add_argument("--run-dir", default="runs/m1-probe")
+    m1_probe.add_argument("--steps", type=int, help="Override configured probe steps")
+    m1_probe.add_argument("--cuda", action="store_true", help="Require CUDA")
+    m1_probe.set_defaults(func=cmd_m1_probe)
 
     synth = sub.add_parser("synth", help="Create a deterministic synthetic motion sample")
     synth.add_argument("--output", default="outputs/sample.pt")

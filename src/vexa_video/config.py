@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
-import tomllib
 from typing import Any
 
 
@@ -50,6 +50,17 @@ class DiffusionConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class M1Config:
+    probe_train_samples: int = 2_048
+    probe_eval_samples: int = 256
+    probe_steps: int = 250
+    probe_batch_size: int = 32
+    probe_learning_rate: float = 1e-3
+    probe_direction_gate: float = 0.95
+    probe_color_gate: float = 0.95
+
+
+@dataclass(frozen=True, slots=True)
 class ProjectConfig:
     seed: int
     data: DataConfig
@@ -57,6 +68,7 @@ class ProjectConfig:
     vae: VAEConfig
     dit: DiTConfig
     diffusion: DiffusionConfig
+    m1: M1Config
 
 
 def _section(raw: dict[str, Any], name: str) -> dict[str, Any]:
@@ -77,6 +89,9 @@ def load_config(path: str | Path) -> ProjectConfig:
     vae_raw = _section(raw, "vae")
     dit_raw = _section(raw, "dit")
     diffusion_raw = _section(raw, "diffusion")
+    m1_raw = raw.get("m1", {})
+    if not isinstance(m1_raw, dict):
+        raise ValueError("[m1] must be a TOML table")
 
     cfg = ProjectConfig(
         seed=int(project["seed"]),
@@ -85,6 +100,7 @@ def load_config(path: str | Path) -> ProjectConfig:
         vae=VAEConfig(**vae_raw),
         dit=DiTConfig(**dit_raw),
         diffusion=DiffusionConfig(**diffusion_raw),
+        m1=M1Config(**m1_raw),
     )
     validate_config(cfg)
     return cfg
@@ -103,3 +119,13 @@ def validate_config(cfg: ProjectConfig) -> None:
         raise ValueError("text.d_model must be divisible by text.heads")
     if cfg.dit.hidden_size % cfg.dit.heads != 0:
         raise ValueError("dit.hidden_size must be divisible by dit.heads")
+    if cfg.m1.probe_train_samples < cfg.m1.probe_batch_size:
+        raise ValueError("m1.probe_train_samples must be >= m1.probe_batch_size")
+    if cfg.m1.probe_eval_samples <= 0 or cfg.m1.probe_steps <= 0:
+        raise ValueError("m1 probe samples/steps must be positive")
+    if cfg.m1.probe_batch_size <= 0 or cfg.m1.probe_learning_rate <= 0:
+        raise ValueError("m1 probe batch size/learning rate must be positive")
+    if not 0.0 < cfg.m1.probe_direction_gate <= 1.0:
+        raise ValueError("m1.probe_direction_gate must be in (0, 1]")
+    if not 0.0 < cfg.m1.probe_color_gate <= 1.0:
+        raise ValueError("m1.probe_color_gate must be in (0, 1]")

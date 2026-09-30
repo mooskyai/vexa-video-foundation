@@ -10,7 +10,7 @@ Research and development of a from-scratch generative video foundation model.
 
 ## Current capability
 
-Milestone 0 only: synthetic data, tokenizer/text encoder, tiny video autoencoder, Video DiT and diffusion primitives.
+Milestone 1 is active. The code now includes a balanced deterministic synthetic-motion curriculum and a supervised direction/color sanity probe on top of the original tokenizer/text encoder, tiny video autoencoder, Video DiT and diffusion primitives.
 
 ## Not currently supported
 
@@ -18,4 +18,4 @@ Do not describe the starter as supporting production text-to-video, photorealist
 
 ## Training data
 
-The starter uses deterministic synthetic clips only. Future checkpoints must link to a versioned provenance manifest.
+The development line uses deterministic synthetic clips only. M1 train/validation/test samples occupy disjoint deterministic seed spaces; future real-data checkpoints must link to a versioned provenance manifest.

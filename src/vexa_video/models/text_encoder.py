@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import cast
 
 import torch
 from torch import Tensor, nn
@@ -48,7 +49,9 @@ class ByteTokenizer:
                 values.append(token_id - 4)
         return bytes(values).decode("utf-8", errors="replace")
 
-    def batch(self, texts: list[str], max_length: int, device: torch.device | None = None) -> TokenBatch:
+    def batch(
+        self, texts: list[str], max_length: int, device: torch.device | None = None
+    ) -> TokenBatch:
         rows = [self.encode(text, max_length) for text in texts]
         input_ids = torch.tensor(rows, dtype=torch.long, device=device)
         attention_mask = input_ids.ne(self.pad_id)
@@ -79,10 +82,10 @@ class TransformerTextEncoder(nn.Module):
             norm_first=True,
         )
         self.encoder = nn.TransformerEncoder(
-                        encoder_layer,
-                        num_layers=layers,
-                        enable_nested_tensor=False,
-                    )
+            encoder_layer,
+            num_layers=layers,
+            enable_nested_tensor=False,
+        )
         self.norm = nn.LayerNorm(d_model)
 
     def forward(self, input_ids: Tensor, attention_mask: Tensor) -> Tensor:
@@ -93,4 +96,4 @@ class TransformerTextEncoder(nn.Module):
         positions = self.position_embedding[:, : input_ids.shape[1]]
         x = self.token_embedding(input_ids) + positions
         x = self.encoder(x, src_key_padding_mask=~attention_mask)
-        return self.norm(x)
+        return cast(Tensor, self.norm(x))

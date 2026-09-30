@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from typing import cast
 
 import torch
 from torch import Tensor, nn
@@ -49,10 +50,10 @@ class VideoDiT(nn.Module):
             norm_first=True,
         )
         self.blocks = nn.TransformerEncoder(
-                    block,
-                    num_layers=layers,
-                    enable_nested_tensor=False,
-                )
+            block,
+            num_layers=layers,
+            enable_nested_tensor=False,
+        )
         self.time_mlp = nn.Sequential(
             nn.Linear(hidden_size, hidden_size * 4),
             nn.SiLU(),
@@ -63,7 +64,9 @@ class VideoDiT(nn.Module):
         self.out = nn.Linear(hidden_size, latent_channels * patch_volume)
         self.norm = nn.LayerNorm(hidden_size)
 
-    def forward(self, latents: Tensor, timesteps: Tensor, text_tokens: Tensor, text_mask: Tensor) -> Tensor:
+    def forward(
+        self, latents: Tensor, timesteps: Tensor, text_tokens: Tensor, text_mask: Tensor
+    ) -> Tensor:
         if latents.ndim != 5:
             raise ValueError("latents must have shape [B, C, T, H, W]")
         if text_tokens.ndim != 3:
@@ -91,4 +94,4 @@ class VideoDiT(nn.Module):
 
         tokens = tokens.view(batch, grid[0], grid[1], grid[2], channels, pt, ph, pw)
         tokens = tokens.permute(0, 4, 1, 5, 2, 6, 3, 7).contiguous()
-        return tokens.view(batch, channels, frames, height, width)
+        return cast(Tensor, tokens.view(batch, channels, frames, height, width))

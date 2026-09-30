@@ -20,9 +20,13 @@ Deliverables:
 
 ## M1 — Synthetic motion world
 
+**Status:** active.
+
 **Goal:** prove temporal learning before real video.
 
-Dataset curriculum:
+M1 starts with a supervised sanity gate while keeping the M0 tokenizer/VAE/DiT/diffusion architecture intact. Stage A uses balanced cardinal controls (right/left/down/up), four colors, square/circle shapes, speed buckets, deterministic captions/trajectories and disjoint split seed spaces. A tiny project-trained motion probe must recover direction and color at >= 0.95 accuracy before generative optimization begins.
+
+Dataset curriculum then expands through:
 
 - moving shapes;
 - acceleration and bounce;
@@ -33,7 +37,7 @@ Dataset curriculum:
 - camera pan/zoom simulation;
 - deterministic captions and ground-truth trajectories.
 
-Exit result: generated clips show measurable motion learning rather than independent-frame noise.
+Exit result: generated clips show measurable motion learning rather than independent-frame noise. The supervised probe is a prerequisite, not the M1 completion criterion.
 
 ## M2 — Video autoencoder v1
 

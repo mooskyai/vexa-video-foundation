@@ -26,21 +26,32 @@ Required:
 
 ## M1 gate — synthetic motion
 
-Dataset tests:
+### Stage A — renderer and supervised temporal sanity
 
-- same seed -> identical clip/caption/trajectory;
-- split determinism;
-- ground-truth trajectory agrees with rendered frames;
-- no train/test seed overlap.
+Required before generative M1 training:
 
-Model quality tests:
+- same seed -> identical clip/caption/trajectory/control;
+- cardinal right/left/down/up trajectory signs match requested controls;
+- balanced direction/color coverage in the deterministic control cycle;
+- train/validation/test seed spaces are disjoint;
+- the `MotionProbe` backpropagates on CPU;
+- `vexa-video m1-probe` evaluates on the held-out `test` seed space;
+- direction accuracy >= 0.95;
+- color accuracy >= 0.95;
+- the probe checkpoint records config, optimizer, seed-space identifier and baseline/final metrics.
 
-- direction accuracy above a documented baseline;
+The supervised probe is deliberately not used as evidence that the generative model follows controls. It only proves the synthetic temporal/appearance signal and label pipeline are learnable.
+
+### M1 final generative gate
+
+Dataset tests continue to require split determinism, trajectory/render agreement and no split leakage as the curriculum expands. Generative quality must then demonstrate:
+
+- direction accuracy above a frozen generated baseline;
 - object/color/count accuracy measured from ground-truth synthetic renderer metadata;
 - temporal trajectory error improves materially over an untrained/random baseline;
 - generated motion does not collapse to static frames.
 
-Metric thresholds are set only after baseline runs and then frozen in the milestone report.
+Final generative thresholds are frozen only after the first reproducible baseline run. M2 remains blocked until that generated-video gate passes.
 
 ## M2 gate — VAE
 

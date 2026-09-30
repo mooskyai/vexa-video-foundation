@@ -8,3 +8,5 @@ def test_tiny_config_loads() -> None:
     cfg = load_config(path)
     assert cfg.data.frames == 8
     assert cfg.text.vocab_size == 260
+    assert cfg.m1.probe_steps == 250
+    assert cfg.m1.probe_direction_gate == 0.95
