@@ -1,0 +1,36 @@
+# Planning/reference config only. Do not expect this to fit on a single workstation GPU.
+[project]
+seed = 42
+
+[data]
+frames = 900            # 30 seconds at 30 fps before temporal compression/chunk planning
+height = 1080
+width = 1920
+
+[text]
+vocab_size = 32768
+max_length = 1024
+d_model = 2048
+layers = 24
+heads = 16
+ff_mult = 4
+
+[vae]
+in_channels = 3
+latent_channels = 32
+base_channels = 256
+spatial_downsample = 16
+temporal_downsample = 8
+
+[dit]
+hidden_size = 4096
+layers = 48
+heads = 32
+patch_t = 1
+patch_h = 2
+patch_w = 2
+
+[diffusion]
+timesteps = 1000
+beta_start = 0.0001
+beta_end = 0.02

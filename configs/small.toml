@@ -1,0 +1,35 @@
+[project]
+seed = 42
+
+[data]
+frames = 16
+height = 128
+width = 128
+
+[text]
+vocab_size = 260
+max_length = 128
+d_model = 256
+layers = 6
+heads = 8
+ff_mult = 4
+
+[vae]
+in_channels = 3
+latent_channels = 8
+base_channels = 64
+spatial_downsample = 8
+temporal_downsample = 4
+
+[dit]
+hidden_size = 512
+layers = 12
+heads = 8
+patch_t = 1
+patch_h = 2
+patch_w = 2
+
+[diffusion]
+timesteps = 1000
+beta_start = 0.0001
+beta_end = 0.02
