@@ -29,3 +29,5 @@ Do not describe the starter as supporting production text-to-video, photorealist
 ## Training data
 
 The development line uses deterministic synthetic clips only. M1 train/validation/test samples occupy disjoint deterministic seed spaces; future real-data checkpoints must link to a versioned provenance manifest.
+
+Stage-B-v4 did not complete M1: its frozen 50-step evaluation reached direction `0.156250`, color `0.781250`, mean motion `0.131964`, and static rate `0.015625`. Validation diagnostics showed that direction is learned at short DDIM horizons and then lost after roughly 8-12 steps. Stage-B-v5 targets full-horizon direction preservation while leaving the final generation protocol unchanged.

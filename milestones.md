@@ -292,3 +292,5 @@ Evaluation dimensions:
 - human preference.
 
 A 'Seedance 2.5/Wan 3.0 level' claim is allowed only after a documented, reproducible evaluation suite supports the relevant dimensions. Capability parity is multidimensional; one attractive demo is not parity.
+
+Stage-B-v5 remains inside M1. The v4 horizon sweep localized the remaining failure to late denoising: direction is nearly perfect through 8 DDIM steps and collapses by 12-16, while color improves over longer trajectories. v5 adds periodic 50-step differentiable direction preservation and full-horizon validation-generation checkpoint selection. M2 stays blocked until the unchanged frozen gate reports `gate_passed=True`.

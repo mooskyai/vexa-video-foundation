@@ -281,3 +281,7 @@ Before making parity claims:
 - avoid collapsing all capability into one opaque score.
 
 The release report must distinguish measured facts from interpretation.
+
+### Stage-B-v5 corrective evidence
+
+The v4 frozen test result remained a failure: direction `0.156250`, color `0.781250`, mean motion `0.131964`, static rate `0.015625`. A separate validation-split sweep showed direction accuracy `1.0` at 4/6 steps, `0.953125` at 8, `0.421875` at 12, and near chance from 16 to 50. v5 must therefore preserve direction through the full 50-step path. Training periodically differentiates through 50 CFG-DDIM steps, and checkpoint selection includes 16 fixed validation-split 50-step generations. The final M1 gate is still the frozen 64-sample test protocol and M2 remains blocked.

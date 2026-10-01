@@ -279,3 +279,7 @@ keeps the same parameter/optimizer layout, so the v2 checkpoint resumes directly
 selector resets again because v3 adds held-out decoded semantic losses.
 
 This does not complete M1. Generated-video quality remains the gate, and M2 remains blocked until the frozen evaluation protocol passes.
+
+### Stage-B-v5 full-horizon preservation
+
+The v4 validation sweep established that caption-controlled direction is correct through roughly eight DDIM steps but is overwritten by later denoising, while color improves at longer horizons. v5 therefore keeps the shared inference/training CFG-DDIM helper, adds a periodic 50-step differentiable direction objective, and uses fixed validation-split 50-step generated metrics in checkpoint selection. This changes training and model selection only; the public 50-step inference protocol and frozen M1 thresholds remain unchanged.

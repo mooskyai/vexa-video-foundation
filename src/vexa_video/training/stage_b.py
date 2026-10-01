@@ -12,9 +12,9 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from vexa_video.config import ProjectConfig
-from vexa_video.data import COLORS, DIRECTIONS, StageBSyntheticDataset
+from vexa_video.data import COLORS, DIRECTIONS, StageBSyntheticDataset, SyntheticControl
 from vexa_video.diffusion import LinearNoiseSchedule
-from vexa_video.inference.sampler import guided_ddim_rollout
+from vexa_video.inference.sampler import guided_ddim_rollout, sample_video
 from vexa_video.models import ByteTokenizer, TinyVideoVAE, TransformerTextEncoder, VideoDiT
 from vexa_video.training.checkpoint import build_stage_b_checkpoint
 
@@ -41,6 +41,8 @@ class StageBStepMetrics:
     direction_prompt_gap: float = 0.0
     semantic_direction_loss: float = 0.0
     semantic_color_loss: float = 0.0
+    full_rollout_direction_loss: float = 0.0
+    full_rollout_color_loss: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -243,7 +245,7 @@ def _motion_target_loss(motion: Tensor, target: Tensor, minimum_motion: float) -
     return (alignment + F.relu(minimum_motion - magnitude)).mean()
 
 
-def _sampler_aligned_direction_loss(
+def _sampler_aligned_losses(
     *,
     components: StageBComponents,
     clean_latents: Tensor,
@@ -251,10 +253,13 @@ def _sampler_aligned_direction_loss(
     cfg: ProjectConfig,
     device: torch.device,
     initial_noise: Tensor,
-) -> Tensor:
+    sampling_steps: int | None = None,
+    minimum_motion: float | None = None,
+) -> tuple[Tensor, Tensor]:
     batch = min(cfg.m1.rollout_batch_size, clean_latents.shape[0], len(captions))
     if batch <= 0:
-        return clean_latents.new_zeros(())
+        zero = clean_latents.new_zeros(())
+        return zero, zero
 
     base_captions = captions[:batch]
     rollout_captions = [
@@ -281,6 +286,7 @@ def _sampler_aligned_direction_loss(
         unconditional_tokens.attention_mask,
     )
     rollout_noise = initial_noise[:batch].repeat_interleave(len(DIRECTIONS), dim=0)
+    steps = sampling_steps if sampling_steps is not None else cfg.m1.rollout_steps
     rollout_latents = guided_ddim_rollout(
         latents=rollout_noise,
         dit=components.dit,
@@ -290,23 +296,33 @@ def _sampler_aligned_direction_loss(
         unconditional_text=unconditional_text,
         unconditional_mask=unconditional_tokens.attention_mask,
         sampling_timesteps=components.schedule.sampling_timesteps(
-            cfg.m1.rollout_steps,
+            steps,
             device=device,
         ),
         guidance_scale=cfg.m1.guidance_scale,
     )
     rollout_video = components.vae.decode(rollout_latents)
-    rollout_motion, _ = _soft_video_features(rollout_video)
+    rollout_motion, rollout_color = _soft_video_features(rollout_video)
     direction_targets = torch.tensor(
         [_DIRECTION_TARGETS[direction] for _ in base_captions for direction in DIRECTIONS],
         device=device,
         dtype=clean_latents.dtype,
     )
-    return _motion_target_loss(
+    color_targets = torch.stack(
+        [
+            _caption_target(caption, _COLOR_TARGETS, device=device, dtype=clean_latents.dtype)
+            for caption in base_captions
+            for _ in DIRECTIONS
+        ]
+    )
+    motion_floor = cfg.m1.semantic_min_motion if minimum_motion is None else minimum_motion
+    direction_loss = _motion_target_loss(
         rollout_motion,
         direction_targets,
-        cfg.m1.semantic_min_motion,
+        motion_floor,
     )
+    color_loss = F.mse_loss(rollout_color, color_targets)
+    return direction_loss, color_loss
 
 
 def _semantic_conditioning_losses(
@@ -386,7 +402,7 @@ def _semantic_conditioning_losses(
         F.mse_loss(correct_color, color_target)
         + F.mse_loss(counterfactual_color, color_counterfactual_target)
     )
-    rollout_direction_loss = _sampler_aligned_direction_loss(
+    rollout_direction_loss, _ = _sampler_aligned_losses(
         components=components,
         clean_latents=clean_latents,
         captions=captions,
@@ -430,6 +446,7 @@ def diffusion_train_step(
     captions: list[str],
     cfg: ProjectConfig,
     device: torch.device,
+    run_full_rollout: bool = False,
 ) -> StageBStepMetrics:
     components.text_encoder.train()
     components.dit.train()
@@ -479,12 +496,27 @@ def diffusion_train_step(
         cfg=cfg,
         device=device,
     )
+    full_rollout_direction_loss = latents.new_zeros(())
+    full_rollout_color_loss = latents.new_zeros(())
+    if run_full_rollout:
+        full_rollout_direction_loss, full_rollout_color_loss = _sampler_aligned_losses(
+            components=components,
+            clean_latents=latents,
+            captions=captions,
+            cfg=cfg,
+            device=device,
+            initial_noise=torch.randn_like(latents),
+            sampling_steps=cfg.m1.full_rollout_steps,
+            minimum_motion=cfg.m1.full_rollout_min_motion,
+        )
     optimization_loss = (
         cfg.m1.diffusion_weight * diffusion_loss
         + cfg.m1.unconditional_loss_weight * unconditional_loss
         + cfg.m1.prompt_contrast_weight * contrast_loss
         + cfg.m1.semantic_direction_weight * semantic_direction_loss
         + cfg.m1.semantic_color_weight * semantic_color_loss
+        + cfg.m1.full_rollout_direction_weight * full_rollout_direction_loss
+        + cfg.m1.full_rollout_color_weight * full_rollout_color_loss
     )
     torch.autograd.backward(optimization_loss)
     trainable = [*components.text_encoder.parameters(), *components.dit.parameters()]
@@ -511,6 +543,8 @@ def diffusion_train_step(
         direction_prompt_gap=float(direction_gap.detach().mean().item()),
         semantic_direction_loss=float(semantic_direction_loss.detach().item()),
         semantic_color_loss=float(semantic_color_loss.detach().item()),
+        full_rollout_direction_loss=float(full_rollout_direction_loss.detach().item()),
+        full_rollout_color_loss=float(full_rollout_color_loss.detach().item()),
     )
 
 
@@ -621,6 +655,55 @@ def validate_stage_b(
     )
 
 
+def _validation_generation_metrics(
+    *,
+    components: StageBComponents,
+    cfg: ProjectConfig,
+    device: torch.device,
+) -> tuple[float, float, float, float]:
+    """Measure fixed validation-split generation at the full frozen sampler horizon."""
+    from vexa_video.training.m1_evaluation import evaluate_generated_videos
+
+    dataset = StageBSyntheticDataset(
+        length=cfg.m1.validation_generation_samples,
+        frames=cfg.data.frames,
+        size=cfg.data.height,
+        base_seed=cfg.seed,
+        split="validation",
+    )
+    generated_batches: list[Tensor] = []
+    controls: list[SyntheticControl] = []
+    for start in range(0, len(dataset), cfg.m1.eval_batch_size):
+        stop = min(start + cfg.m1.eval_batch_size, len(dataset))
+        batch_samples = [dataset.sample(index) for index in range(start, stop)]
+        generated = sample_video(
+            cfg=cfg,
+            tokenizer=components.tokenizer,
+            text_encoder=components.text_encoder,
+            vae=components.vae,
+            dit=components.dit,
+            schedule=components.schedule,
+            prompts=[sample.caption for sample in batch_samples],
+            seed=cfg.seed + 80_000 + start,
+            sampling_steps=cfg.m1.full_rollout_steps,
+            device=device,
+        )
+        generated_batches.append(generated.cpu())
+        controls.extend(sample.control for sample in batch_samples)
+    metrics = evaluate_generated_videos(
+        torch.cat(generated_batches, dim=0),
+        controls,
+        static_motion_threshold=cfg.m1.static_motion_threshold,
+        sampling_steps=cfg.m1.full_rollout_steps,
+    )
+    return (
+        metrics.direction_accuracy,
+        metrics.color_accuracy,
+        metrics.mean_motion,
+        metrics.static_rate,
+    )
+
+
 def _freeze_vae(vae: TinyVideoVAE) -> None:
     vae.eval()
     for parameter in vae.parameters():
@@ -710,12 +793,12 @@ def _save_checkpoint(
         metadata={
             "selection": (
                 "best.pt minimizes held-out reconstruction + diffusion + "
-                "prompt-gap + semantic penalties"
+                "prompt-gap + semantic + full-horizon generated-validation penalties"
             ),
             "curriculum": "one object; four directions; four colors; square/circle; medium speed",
             "conditioning": (
                 "byte-text only; token attention + text counterfactuals + "
-                "decoded semantic motion/color losses + CFG"
+                "decoded semantic losses + balanced full-horizon motion/color preservation"
             ),
         },
     )
@@ -787,6 +870,12 @@ def train_stage_b(
         if not isinstance(resume_m1, dict) or "semantic_direction_weight" not in resume_m1:
             best_validation_score = math.inf
             print("m1_stage_b resume_revision=semantic-v3 reset_best_validation_score=true")
+        elif "full_rollout_color_weight" not in resume_m1:
+            best_validation_score = math.inf
+            print(
+                "m1_stage_b resume_revision=balanced-full-horizon-v5 "
+                "reset_best_validation_score=true"
+            )
         print(
             "m1_stage_b resumed "
             f"checkpoint={resume_path} phase={phase} vae_step={vae_step} "
@@ -879,6 +968,7 @@ def train_stage_b(
             captions=captions,
             cfg=cfg,
             device=device,
+            run_full_rollout=diffusion_step % cfg.m1.full_rollout_every == 0,
         )
         if diffusion_step == 1 or diffusion_step % cfg.m1.log_every == 0:
             print(
@@ -890,6 +980,8 @@ def train_stage_b(
                 f"direction_gap={last_metrics.direction_prompt_gap:.6f} "
                 f"semantic_direction={last_metrics.semantic_direction_loss:.6f} "
                 f"semantic_color={last_metrics.semantic_color_loss:.6f} "
+                f"full_rollout_direction={last_metrics.full_rollout_direction_loss:.6f} "
+                f"full_rollout_color={last_metrics.full_rollout_color_loss:.6f} "
                 f"total={last_metrics.total_loss:.6f} "
                 f"grad_norm={last_metrics.gradient_norm:.6f}"
             )
@@ -915,12 +1007,52 @@ def train_stage_b(
                 max(0.0, cfg.m1.prompt_contrast_margin - validation_color_gap)
                 + max(0.0, cfg.m1.prompt_contrast_margin - validation_direction_gap)
             )
+            (
+                validation_generated_direction,
+                validation_generated_color,
+                validation_generated_motion,
+                validation_generated_static,
+            ) = _validation_generation_metrics(
+                components=components,
+                cfg=cfg,
+                device=device,
+            )
+            generated_direction_penalty = (
+                max(
+                    0.0,
+                    cfg.m1.generation_direction_gate - validation_generated_direction,
+                )
+                / cfg.m1.generation_direction_gate
+            )
+            generated_color_penalty = (
+                max(
+                    0.0,
+                    cfg.m1.generation_color_gate - validation_generated_color,
+                )
+                / cfg.m1.generation_color_gate
+            )
+            generated_static_penalty = max(
+                0.0,
+                validation_generated_static - cfg.m1.generation_static_rate_gate,
+            ) / max(cfg.m1.generation_static_rate_gate, 1e-8)
+            generated_motion_penalty = (
+                max(
+                    0.0,
+                    cfg.m1.generation_mean_motion_gate - validation_generated_motion,
+                )
+                / cfg.m1.generation_mean_motion_gate
+            )
+            generated_other_penalty = (
+                generated_color_penalty + generated_static_penalty + generated_motion_penalty
+            )
             validation_score = (
                 cfg.m1.reconstruction_weight * validation_reconstruction
                 + cfg.m1.diffusion_weight * validation_diffusion
                 + cfg.m1.prompt_contrast_weight * conditioning_penalty
                 + cfg.m1.semantic_direction_weight * validation_semantic_direction
                 + cfg.m1.semantic_color_weight * validation_semantic_color
+                + cfg.m1.validation_generation_direction_weight * generated_direction_penalty
+                + cfg.m1.validation_generation_other_weight * generated_other_penalty
             )
             checkpoint_metrics = {
                 **asdict(last_metrics),
@@ -931,6 +1063,15 @@ def train_stage_b(
                 "validation_conditioning_penalty": conditioning_penalty,
                 "validation_semantic_direction_loss": validation_semantic_direction,
                 "validation_semantic_color_loss": validation_semantic_color,
+                "validation_generated_direction_accuracy": validation_generated_direction,
+                "validation_generated_color_accuracy": validation_generated_color,
+                "validation_generated_mean_motion": validation_generated_motion,
+                "validation_generated_static_rate": validation_generated_static,
+                "validation_generated_direction_penalty": generated_direction_penalty,
+                "validation_generated_color_penalty": generated_color_penalty,
+                "validation_generated_static_penalty": generated_static_penalty,
+                "validation_generated_motion_penalty": generated_motion_penalty,
+                "validation_generated_other_penalty": generated_other_penalty,
                 "validation_score": validation_score,
                 "vae_validation_reconstruction_loss": vae_validation_loss,
             }
@@ -974,6 +1115,10 @@ def train_stage_b(
                 f"direction_gap={validation_direction_gap:.6f} "
                 f"semantic_direction={validation_semantic_direction:.6f} "
                 f"semantic_color={validation_semantic_color:.6f} "
+                f"generated_direction={validation_generated_direction:.6f} "
+                f"generated_color={validation_generated_color:.6f} "
+                f"generated_motion={validation_generated_motion:.6f} "
+                f"generated_static={validation_generated_static:.6f} "
                 f"score={validation_score:.6f}"
             )
 

@@ -184,6 +184,36 @@ cardinal-motion loss. All four direction captions share the same starting noise,
 cause the motion difference. This is a training-only correction; the frozen 50-step evaluation path,
 guidance scale and M1 thresholds do not change. The v4 target is 10000 diffusion steps.
 
+Stage-B-v4 proved that direction control is horizon-specific rather than absent. Its frozen 50-step
+result was direction `0.156250`, color `0.781250`, mean motion `0.131964`, static rate `0.015625`.
+A validation-only horizon sweep then measured direction `1.000000` at 4 and 6 steps, `0.953125` at
+8, `0.421875` at 12, and near chance from 16 through 50 steps. The first Stage-B-v5 correction added
+a periodic differentiable 50-step direction loss and solved direction completely, but its frozen
+50-step test result regressed color/static behavior: direction `1.000000`, color `0.343750`, mean
+motion `0.044545`, static rate `0.156250`. This remains a Stage-B-v5 regression correction rather
+than a new milestone.
+
+The balanced v5 correction restarts from the v4 `best.pt`, where color/static already passed. The
+same 50-step four-direction rollout now supervises both cardinal motion and the original caption color,
+so no additional expensive rollout is required. The full-horizon direction term is reduced to avoid
+dominating the clipped gradient, and the long-horizon minimum displacement is raised to protect the
+static-rate gate. Validation checkpoint selection uses normalized deficits against all four frozen gates
+so a solved direction score cannot hide a color/static regression.
+
+Run the balanced v5 correction in a fresh directory:
+
+```powershell
+uv run vexa-video train `
+  --config configs/tiny.toml `
+  --run-dir runs/m1-stage-b-v5-balanced `
+  --resume runs/m1-stage-b-v4/checkpoints/best.pt `
+  --cuda
+```
+
+The target remains 13000 diffusion steps. Every fourth optimization step uses the balanced 50-step
+preservation objective; every checkpoint interval runs the fixed 16-sample validation-split 50-step
+selector. The frozen 64-sample test protocol and all absolute M1 thresholds remain unchanged.
+
 Because the corrective path changes the generation protocol (token attention + guidance), record
 a fresh random baseline before corrective training. The absolute M1 thresholds do not change:
 

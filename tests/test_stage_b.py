@@ -19,6 +19,7 @@ from vexa_video.training.m1_evaluation import (
 from vexa_video.training.stage_b import (
     _normalize_cuda_rng_states,
     _soft_video_features,
+    _validation_generation_metrics,
     build_stage_b_components,
     diffusion_train_step,
     load_stage_b_weights,
@@ -44,6 +45,9 @@ def _tiny_test_config():
             semantic_timestep=10,
             rollout_steps=2,
             rollout_batch_size=1,
+            full_rollout_steps=2,
+            full_rollout_every=1,
+            validation_generation_samples=16,
         ),
     )
 
@@ -128,6 +132,53 @@ def test_diffusion_train_step_is_finite_and_reaches_text_and_dit() -> None:
     assert torch.isfinite(torch.tensor(metrics.semantic_color_loss))
     assert any(parameter.grad is not None for parameter in components.text_encoder.parameters())
     assert any(parameter.grad is not None for parameter in components.dit.parameters())
+
+
+def test_full_horizon_rollout_loss_is_finite_and_reaches_trainable_path() -> None:
+    cfg = _tiny_test_config()
+    components = build_stage_b_components(cfg, device=torch.device("cpu"))
+    for parameter in components.vae.parameters():
+        parameter.requires_grad_(False)
+    optimizer = torch.optim.AdamW(
+        [*components.text_encoder.parameters(), *components.dit.parameters()],
+        lr=cfg.m1.learning_rate,
+    )
+    sample = StageBSyntheticDataset(
+        length=1,
+        frames=cfg.data.frames,
+        size=cfg.data.height,
+        base_seed=cfg.seed,
+        split="train",
+    ).sample(0)
+    metrics = diffusion_train_step(
+        components=components,
+        optimizer=optimizer,
+        videos=sample.video.unsqueeze(0),
+        captions=[sample.caption],
+        cfg=cfg,
+        device=torch.device("cpu"),
+        run_full_rollout=True,
+    )
+    assert torch.isfinite(torch.tensor(metrics.full_rollout_direction_loss))
+    assert torch.isfinite(torch.tensor(metrics.full_rollout_color_loss))
+    assert metrics.full_rollout_direction_loss >= 0.0
+    assert metrics.full_rollout_color_loss >= 0.0
+    assert any(parameter.grad is not None for parameter in components.text_encoder.parameters())
+    assert any(parameter.grad is not None for parameter in components.dit.parameters())
+
+
+def test_validation_generation_metrics_use_full_horizon() -> None:
+    cfg = _tiny_test_config()
+    components = build_stage_b_components(cfg, device=torch.device("cpu"))
+    direction, color, motion, static = _validation_generation_metrics(
+        components=components,
+        cfg=cfg,
+        device=torch.device("cpu"),
+    )
+    assert 0.0 <= direction <= 1.0
+    assert 0.0 <= color <= 1.0
+    assert motion >= 0.0
+    assert 0.0 <= static <= 1.0
 
 
 def test_sampler_shape_and_fixed_seed_determinism() -> None:

@@ -86,6 +86,14 @@ class M1Config:
     rollout_steps: int = 4
     rollout_batch_size: int = 1
     rollout_direction_weight: float = 1.0
+    full_rollout_steps: int = 50
+    full_rollout_every: int = 4
+    full_rollout_direction_weight: float = 0.25
+    full_rollout_color_weight: float = 1.0
+    full_rollout_min_motion: float = 0.35
+    validation_generation_samples: int = 16
+    validation_generation_direction_weight: float = 1.0
+    validation_generation_other_weight: float = 1.0
     guidance_scale: float = 3.0
     generation_direction_gate: float = 0.75
     generation_color_gate: float = 0.75
@@ -206,6 +214,30 @@ def validate_config(cfg: ProjectConfig) -> None:
         raise ValueError("m1.rollout_batch_size must be positive")
     if cfg.m1.rollout_direction_weight < 0:
         raise ValueError("m1.rollout_direction_weight must be non-negative")
+    if not cfg.m1.rollout_steps <= cfg.m1.full_rollout_steps <= cfg.m1.sampling_steps:
+        raise ValueError("m1.full_rollout_steps must be in [m1.rollout_steps, m1.sampling_steps]")
+    if cfg.m1.full_rollout_every <= 0:
+        raise ValueError("m1.full_rollout_every must be positive")
+    if cfg.m1.full_rollout_direction_weight < 0:
+        raise ValueError("m1.full_rollout_direction_weight must be non-negative")
+    if (
+        cfg.m1.validation_generation_samples <= 0
+        or cfg.m1.validation_generation_samples % 16 != 0
+        or cfg.m1.validation_generation_samples > cfg.m1.validation_samples
+    ):
+        raise ValueError(
+            "m1.validation_generation_samples must be a positive multiple of 16 "
+            "not exceeding m1.validation_samples"
+        )
+    if (
+        cfg.m1.validation_generation_direction_weight < 0
+        or cfg.m1.validation_generation_other_weight < 0
+    ):
+        raise ValueError("m1 validation-generation weights must be non-negative")
+    if cfg.m1.full_rollout_color_weight < 0:
+        raise ValueError("m1.full_rollout_color_weight must be non-negative")
+    if cfg.m1.full_rollout_min_motion <= 0:
+        raise ValueError("m1.full_rollout_min_motion must be positive")
     if cfg.m1.guidance_scale < 1.0:
         raise ValueError("m1.guidance_scale must be >= 1")
     if not 0.0 < cfg.m1.generation_direction_gate <= 1.0:
