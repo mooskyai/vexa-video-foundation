@@ -1,0 +1,250 @@
+from __future__ import annotations
+
+from dataclasses import replace
+from pathlib import Path
+
+import pytest
+import torch
+
+from vexa_video.config import load_config
+from vexa_video.data import StageBSyntheticDataset
+from vexa_video.inference import sample_video
+from vexa_video.models.dit import spatiotemporal_position_embedding, token_text_attention
+from vexa_video.training.checkpoint import build_stage_b_checkpoint
+from vexa_video.training.m1_evaluation import (
+    evaluate_generated_videos,
+    passes_m1_generation_gate,
+)
+from vexa_video.training.stage_b import (
+    _normalize_cuda_rng_states,
+    _soft_video_features,
+    build_stage_b_components,
+    diffusion_train_step,
+    load_stage_b_weights,
+)
+
+
+def _tiny_test_config():
+    cfg = load_config(Path(__file__).parents[1] / "configs" / "tiny.toml")
+    return replace(
+        cfg,
+        text=replace(cfg.text, d_model=16, layers=1, heads=2, ff_mult=2, max_length=48),
+        vae=replace(cfg.vae, base_channels=4),
+        dit=replace(cfg.dit, hidden_size=24, layers=1, heads=2),
+        diffusion=replace(cfg.diffusion, timesteps=20),
+        m1=replace(
+            cfg.m1,
+            batch_size=1,
+            train_samples=32,
+            validation_samples=16,
+            sampling_steps=2,
+            eval_samples=16,
+            eval_batch_size=1,
+            semantic_timestep=10,
+        ),
+    )
+
+
+def test_stage_b_curriculum_is_fixed_medium_and_balanced() -> None:
+    dataset = StageBSyntheticDataset(
+        length=32,
+        frames=8,
+        size=32,
+        base_seed=42,
+        split="train",
+    )
+    controls = [dataset.sample(index).control for index in range(32)]
+    assert {control.speed_bucket for control in controls} == {"medium"}
+    assert {control.direction for control in controls} == {"right", "left", "down", "up"}
+    assert {control.color for control in controls} == {"red", "green", "blue", "yellow"}
+    assert {control.shape for control in controls} == {"square", "circle"}
+
+
+def test_spatiotemporal_positions_are_location_dependent() -> None:
+    embedding = spatiotemporal_position_embedding(
+        (2, 2, 2),
+        24,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    assert embedding.shape == (1, 8, 24)
+    assert not torch.equal(embedding[:, 0], embedding[:, -1])
+
+
+def test_token_text_attention_uses_unmasked_token_content() -> None:
+    video = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]])
+    text = torch.tensor([[[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]]])
+    mask = torch.tensor([[True, True, False]])
+    conditioned = token_text_attention(video, text, mask)
+    assert conditioned.shape == video.shape
+    assert conditioned[0, 0, 0] > conditioned[0, 0, 1]
+    assert conditioned[0, 1, 1] > conditioned[0, 1, 0]
+
+
+def test_soft_video_features_recover_cardinal_direction_and_color() -> None:
+    dataset = StageBSyntheticDataset(length=4, frames=8, size=32, base_seed=42, split="train")
+    videos = torch.stack([dataset.sample(index).video for index in range(4)])
+    motion, color = _soft_video_features(videos)
+    assert motion[0, 0] > 0
+    assert motion[1, 0] < 0
+    assert motion[2, 1] > 0
+    assert motion[3, 1] < 0
+    assert color.shape == (4, 3)
+
+
+def test_diffusion_train_step_is_finite_and_reaches_text_and_dit() -> None:
+    cfg = _tiny_test_config()
+    components = build_stage_b_components(cfg, device=torch.device("cpu"))
+    for parameter in components.vae.parameters():
+        parameter.requires_grad_(False)
+    optimizer = torch.optim.AdamW(
+        [*components.text_encoder.parameters(), *components.dit.parameters()],
+        lr=cfg.m1.learning_rate,
+    )
+    dataset = StageBSyntheticDataset(
+        length=1,
+        frames=cfg.data.frames,
+        size=cfg.data.height,
+        base_seed=cfg.seed,
+        split="train",
+    )
+    sample = dataset.sample(0)
+    metrics = diffusion_train_step(
+        components=components,
+        optimizer=optimizer,
+        videos=sample.video.unsqueeze(0),
+        captions=[sample.caption],
+        cfg=cfg,
+        device=torch.device("cpu"),
+    )
+    assert torch.isfinite(torch.tensor(metrics.total_loss))
+    assert torch.isfinite(torch.tensor(metrics.prompt_contrast_loss))
+    assert torch.isfinite(torch.tensor(metrics.color_prompt_gap))
+    assert torch.isfinite(torch.tensor(metrics.direction_prompt_gap))
+    assert torch.isfinite(torch.tensor(metrics.semantic_direction_loss))
+    assert torch.isfinite(torch.tensor(metrics.semantic_color_loss))
+    assert any(parameter.grad is not None for parameter in components.text_encoder.parameters())
+    assert any(parameter.grad is not None for parameter in components.dit.parameters())
+
+
+def test_sampler_shape_and_fixed_seed_determinism() -> None:
+    cfg = _tiny_test_config()
+    torch.manual_seed(3)
+    components = build_stage_b_components(cfg, device=torch.device("cpu"))
+    kwargs = dict(
+        cfg=cfg,
+        tokenizer=components.tokenizer,
+        text_encoder=components.text_encoder,
+        vae=components.vae,
+        dit=components.dit,
+        schedule=components.schedule,
+        prompts=["a red square moves right at medium speed"],
+        seed=123,
+        sampling_steps=2,
+        device=torch.device("cpu"),
+    )
+    first = sample_video(**kwargs)
+    second = sample_video(**kwargs)
+    unguided = sample_video(**kwargs, guidance_scale=1.0)
+    assert first.shape == (1, 3, cfg.data.frames, cfg.data.height, cfg.data.width)
+    assert torch.equal(first, second)
+    assert not torch.equal(first, unguided)
+
+
+def test_generated_metrics_identify_cardinal_synthetic_videos() -> None:
+    dataset = StageBSyntheticDataset(
+        length=16,
+        frames=8,
+        size=32,
+        base_seed=42,
+        split="test",
+    )
+    samples = [dataset.sample(index) for index in range(16)]
+    videos = torch.stack([sample.video for sample in samples])
+    metrics = evaluate_generated_videos(
+        videos,
+        [sample.control for sample in samples],
+        static_motion_threshold=0.02,
+        sampling_steps=2,
+    )
+    assert metrics.direction_accuracy == 1.0
+    assert metrics.color_accuracy == 1.0
+    assert metrics.static_rate == 0.0
+    assert metrics.mean_motion > 0.02
+    assert passes_m1_generation_gate(metrics, _tiny_test_config())
+
+
+def test_stage_b_checkpoint_round_trip(tmp_path: Path) -> None:
+    cfg = _tiny_test_config()
+    device = torch.device("cpu")
+    components = build_stage_b_components(cfg, device=device)
+    vae_optimizer = torch.optim.AdamW(components.vae.parameters(), lr=cfg.m1.vae_learning_rate)
+    diffusion_optimizer = torch.optim.AdamW(
+        [*components.text_encoder.parameters(), *components.dit.parameters()],
+        lr=cfg.m1.learning_rate,
+    )
+    generator = torch.Generator().manual_seed(9)
+    checkpoint = build_stage_b_checkpoint(
+        vae=components.vae,
+        text_encoder=components.text_encoder,
+        dit=components.dit,
+        vae_optimizer=vae_optimizer,
+        diffusion_optimizer=diffusion_optimizer,
+        global_step=7,
+        vae_step=5,
+        diffusion_step=2,
+        config={"seed": cfg.seed},
+        metrics={"validation_score": 1.0},
+        best_validation_score=1.0,
+        phase="diffusion",
+        data_generator_state=generator.get_state(),
+    )
+    path = tmp_path / "checkpoint.pt"
+    torch.save(checkpoint, path)
+    restored = build_stage_b_components(cfg, device=device)
+    payload = load_stage_b_weights(path, components=restored, device=device)
+    assert payload["diffusion_step"] == 2
+    for left, right in zip(components.dit.parameters(), restored.dit.parameters(), strict=True):
+        assert torch.equal(left, right)
+
+
+def test_train_resume_restores_progress(tmp_path: Path) -> None:
+    from vexa_video.training.stage_b import train_stage_b
+
+    cfg = _tiny_test_config()
+    cfg = replace(
+        cfg,
+        m1=replace(
+            cfg.m1,
+            vae_warmup_steps=1,
+            vae_reconstruction_gate=10.0,
+            max_steps=2,
+            checkpoint_every=1,
+            log_every=1,
+            validation_samples=4,
+        ),
+    )
+    first = train_stage_b(cfg, device=torch.device("cpu"), run_dir=tmp_path, steps=1)
+    resumed = train_stage_b(
+        cfg,
+        device=torch.device("cpu"),
+        run_dir=tmp_path,
+        steps=2,
+        resume=first.latest_checkpoint,
+    )
+    assert first.diffusion_step == 1
+    assert resumed.diffusion_step == 2
+
+
+def test_cuda_rng_states_are_normalized_to_cpu_byte_tensors() -> None:
+    state = torch.arange(32, dtype=torch.uint8)
+    normalized = _normalize_cuda_rng_states((state.clone(),))
+    assert len(normalized) == 1
+    assert normalized[0].device.type == "cpu"
+    assert normalized[0].dtype == torch.uint8
+    assert torch.equal(normalized[0], state)
+
+
+def test_cuda_rng_state_normalization_rejects_invalid_dtype() -> None:
+    with pytest.raises(ValueError, match=r"torch\.uint8"):
+        _normalize_cuda_rng_states([torch.zeros(8, dtype=torch.float32)])

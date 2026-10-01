@@ -2,21 +2,36 @@ from __future__ import annotations
 
 import argparse
 import platform
+import subprocess
 from dataclasses import asdict
 from pathlib import Path
 
 import torch
+from torch import Tensor
 
 from vexa_video.config import load_config
 from vexa_video.data.synthetic import render_moving_square
 from vexa_video.diffusion import LinearNoiseSchedule
+from vexa_video.inference import sample_video
 from vexa_video.models import ByteTokenizer, TinyVideoVAE, TransformerTextEncoder, VideoDiT
-from vexa_video.training import train_m1_probe
+from vexa_video.training import (
+    build_stage_b_components,
+    evaluate_m1_generation,
+    load_stage_b_weights,
+    train_m1_probe,
+    train_stage_b,
+)
 from vexa_video.utils.seed import seed_everything
 
 
 def parameter_count(module: torch.nn.Module) -> int:
     return sum(parameter.numel() for parameter in module.parameters())
+
+
+def _device_from_args(args: argparse.Namespace) -> torch.device:
+    if args.cuda and not torch.cuda.is_available():
+        raise RuntimeError("--cuda requested but CUDA is not available")
+    return torch.device("cuda" if args.cuda else "cpu")
 
 
 def cmd_doctor(_: argparse.Namespace) -> int:
@@ -113,9 +128,7 @@ def cmd_synth(args: argparse.Namespace) -> int:
 def cmd_m1_probe(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
     seed_everything(cfg.seed)
-    if args.cuda and not torch.cuda.is_available():
-        raise RuntimeError("--cuda requested but CUDA is not available")
-    device = torch.device("cuda" if args.cuda else "cpu")
+    device = _device_from_args(args)
     result = train_m1_probe(
         cfg,
         device=device,
@@ -129,6 +142,124 @@ def cmd_m1_probe(args: argparse.Namespace) -> int:
     print(f"color_accuracy={result.color_accuracy:.6f}")
     print(f"gate_passed={result.gate_passed}")
     print(f"checkpoint={result.checkpoint}")
+    return 0
+
+
+def cmd_train(args: argparse.Namespace) -> int:
+    cfg = load_config(args.config)
+    seed_everything(cfg.seed)
+    device = _device_from_args(args)
+    result = train_stage_b(
+        cfg,
+        device=device,
+        run_dir=args.run_dir,
+        steps=args.steps,
+        resume=args.resume,
+    )
+    print(f"device={device}")
+    print(f"diffusion_step={result.diffusion_step}")
+    print(f"vae_validation_reconstruction_loss={result.vae_validation_reconstruction_loss:.6f}")
+    print(f"best_validation_score={result.best_validation_score:.6f}")
+    print(f"latest_checkpoint={result.latest_checkpoint}")
+    print(f"best_checkpoint={result.best_checkpoint}")
+    return 0
+
+
+def cmd_evaluate_m1(args: argparse.Namespace) -> int:
+    cfg = load_config(args.config)
+    seed_everything(cfg.seed)
+    device = _device_from_args(args)
+    components = build_stage_b_components(cfg, device=device)
+    evaluation_kind = "random_baseline"
+    if args.checkpoint is not None:
+        load_stage_b_weights(args.checkpoint, components=components, device=device)
+        evaluation_kind = "checkpoint"
+    output = args.output
+    result = evaluate_m1_generation(
+        cfg=cfg,
+        components=components,
+        device=device,
+        samples=args.samples,
+        sampling_steps=args.sampling_steps,
+        output=output,
+    )
+    print(f"evaluation={evaluation_kind}")
+    print(f"device={device}")
+    print(f"samples={result.samples}")
+    print(f"sampling_steps={result.sampling_steps}")
+    print(f"guidance_scale={result.guidance_scale:.6f}")
+    print(f"direction_accuracy={result.direction_accuracy:.6f}")
+    print(f"color_accuracy={result.color_accuracy:.6f}")
+    print(f"mean_motion={result.mean_motion:.6f}")
+    print(f"static_rate={result.static_rate:.6f}")
+    print(f"direction_confusion={result.direction_confusion}")
+    print(f"color_confusion={result.color_confusion}")
+    print(f"gate_passed={result.gate_passed}")
+    if output is not None:
+        print(f"metrics={output}")
+    return 0
+
+
+def _save_mp4(video: Tensor, output: Path, *, fps: int) -> None:
+    rgb = ((video.detach().cpu() + 1.0) * 127.5).round().clamp(0, 255).to(torch.uint8)
+    frames = rgb.permute(1, 2, 3, 0).contiguous()
+    height = int(frames.shape[1])
+    width = int(frames.shape[2])
+    output.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-s",
+            f"{width}x{height}",
+            "-r",
+            str(fps),
+            "-i",
+            "-",
+            "-an",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            str(output),
+        ],
+        input=frames.numpy().tobytes(),
+        check=True,
+    )
+
+
+def cmd_generate(args: argparse.Namespace) -> int:
+    cfg = load_config(args.config)
+    seed_everything(cfg.seed)
+    device = _device_from_args(args)
+    components = build_stage_b_components(cfg, device=device)
+    load_stage_b_weights(args.checkpoint, components=components, device=device)
+    video = sample_video(
+        cfg=cfg,
+        tokenizer=components.tokenizer,
+        text_encoder=components.text_encoder,
+        vae=components.vae,
+        dit=components.dit,
+        schedule=components.schedule,
+        prompts=[args.prompt],
+        seed=args.seed,
+        sampling_steps=args.sampling_steps,
+        device=device,
+    )[0]
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if output.suffix.lower() == ".mp4":
+        _save_mp4(video, output, fps=args.fps)
+    else:
+        torch.save({"video": video.cpu(), "prompt": args.prompt, "seed": args.seed}, output)
+    print(f"saved={output}")
+    print(f"shape={tuple(video.shape)}")
     return 0
 
 
@@ -153,6 +284,40 @@ def build_parser() -> argparse.ArgumentParser:
     m1_probe.add_argument("--steps", type=int, help="Override configured probe steps")
     m1_probe.add_argument("--cuda", action="store_true", help="Require CUDA")
     m1_probe.set_defaults(func=cmd_m1_probe)
+
+    train = sub.add_parser("train", help="Train M1 Stage-B generative synthetic motion")
+    train.add_argument("--config", default="configs/tiny.toml")
+    train.add_argument("--run-dir", default="runs/m1-stage-b")
+    train.add_argument("--steps", type=int, help="Override configured diffusion steps")
+    train.add_argument("--resume", help="Resume a Stage-B checkpoint")
+    train.add_argument("--cuda", action="store_true", help="Require CUDA")
+    train.set_defaults(func=cmd_train)
+
+    evaluate = sub.add_parser("evaluate-m1", help="Evaluate complete generated M1 videos")
+    evaluate.add_argument("--config", default="configs/tiny.toml")
+    evaluation_source = evaluate.add_mutually_exclusive_group(required=True)
+    evaluation_source.add_argument("--checkpoint", help="Stage-B checkpoint to evaluate")
+    evaluation_source.add_argument(
+        "--random-baseline",
+        action="store_true",
+        help="Evaluate the frozen random model baseline",
+    )
+    evaluate.add_argument("--samples", type=int, help="Balanced sample count (multiple of 16)")
+    evaluate.add_argument("--sampling-steps", type=int, help="Reverse diffusion steps")
+    evaluate.add_argument("--output", help="Optional metrics JSON path")
+    evaluate.add_argument("--cuda", action="store_true", help="Require CUDA")
+    evaluate.set_defaults(func=cmd_evaluate_m1)
+
+    generate = sub.add_parser("generate", help="Generate a video from a Stage-B checkpoint")
+    generate.add_argument("--config", default="configs/tiny.toml")
+    generate.add_argument("--checkpoint", required=True)
+    generate.add_argument("--prompt", required=True)
+    generate.add_argument("--output", required=True)
+    generate.add_argument("--seed", type=int, default=42)
+    generate.add_argument("--sampling-steps", type=int, help="Reverse diffusion steps")
+    generate.add_argument("--fps", type=int, default=8)
+    generate.add_argument("--cuda", action="store_true", help="Require CUDA")
+    generate.set_defaults(func=cmd_generate)
 
     synth = sub.add_parser("synth", help="Create a deterministic synthetic motion sample")
     synth.add_argument("--output", default="outputs/sample.pt")

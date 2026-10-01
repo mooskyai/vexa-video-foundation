@@ -24,3 +24,41 @@ class LinearNoiseSchedule:
         while alpha.ndim < clean.ndim:
             alpha = alpha.unsqueeze(-1)
         return alpha.sqrt() * clean + (1.0 - alpha).sqrt() * noise
+
+    def sampling_timesteps(self, steps: int, *, device: torch.device) -> Tensor:
+        if not 1 <= steps <= self.timesteps:
+            raise ValueError("sampling steps must be in [1, timesteps]")
+        return (
+            torch.linspace(
+                self.timesteps - 1,
+                0,
+                steps=steps,
+                device=device,
+                dtype=torch.float32,
+            )
+            .round()
+            .to(dtype=torch.long)
+        )
+
+    def predict_clean(self, sample: Tensor, predicted_noise: Tensor, timestep: int) -> Tensor:
+        if sample.shape != predicted_noise.shape:
+            raise ValueError("sample and predicted_noise must have identical shapes")
+        alpha = self.alpha_cumprod.to(device=sample.device, dtype=sample.dtype)[timestep]
+        return (sample - (1.0 - alpha).sqrt() * predicted_noise) / alpha.sqrt().clamp_min(1e-8)
+
+    def ddim_step(
+        self,
+        sample: Tensor,
+        predicted_noise: Tensor,
+        *,
+        timestep: int,
+        previous_timestep: int,
+    ) -> Tensor:
+        """Deterministic DDIM-style epsilon step (eta=0)."""
+        clean = self.predict_clean(sample, predicted_noise, timestep)
+        if previous_timestep < 0:
+            return clean
+        alpha_previous = self.alpha_cumprod.to(device=sample.device, dtype=sample.dtype)[
+            previous_timestep
+        ]
+        return alpha_previous.sqrt() * clean + (1.0 - alpha_previous).sqrt() * predicted_noise

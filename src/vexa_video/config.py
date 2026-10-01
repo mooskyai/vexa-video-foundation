@@ -58,6 +58,36 @@ class M1Config:
     probe_learning_rate: float = 1e-3
     probe_direction_gate: float = 0.95
     probe_color_gate: float = 0.95
+    train_samples: int = 2_048
+    validation_samples: int = 256
+    batch_size: int = 8
+    learning_rate: float = 3e-4
+    vae_learning_rate: float = 1e-3
+    vae_warmup_steps: int = 400
+    vae_reconstruction_gate: float = 0.20
+    max_steps: int = 2_000
+    checkpoint_every: int = 100
+    log_every: int = 20
+    reconstruction_weight: float = 1.0
+    diffusion_weight: float = 1.0
+    grad_clip: float = 1.0
+    sampling_steps: int = 50
+    eval_samples: int = 64
+    eval_batch_size: int = 4
+    static_motion_threshold: float = 0.02
+    prompt_contrast_weight: float = 2.0
+    prompt_contrast_margin: float = 0.02
+    unconditional_loss_weight: float = 0.1
+    high_noise_conditioning_fraction: float = 0.5
+    semantic_timestep: int = 500
+    semantic_direction_weight: float = 2.0
+    semantic_color_weight: float = 0.5
+    semantic_min_motion: float = 0.10
+    guidance_scale: float = 3.0
+    generation_direction_gate: float = 0.75
+    generation_color_gate: float = 0.75
+    generation_static_rate_gate: float = 0.10
+    generation_mean_motion_gate: float = 0.02
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,3 +159,51 @@ def validate_config(cfg: ProjectConfig) -> None:
         raise ValueError("m1.probe_direction_gate must be in (0, 1]")
     if not 0.0 < cfg.m1.probe_color_gate <= 1.0:
         raise ValueError("m1.probe_color_gate must be in (0, 1]")
+    if cfg.m1.train_samples < cfg.m1.batch_size:
+        raise ValueError("m1.train_samples must be >= m1.batch_size")
+    if cfg.m1.validation_samples <= 0 or cfg.m1.batch_size <= 0:
+        raise ValueError("m1 validation samples/batch size must be positive")
+    if cfg.m1.learning_rate <= 0 or cfg.m1.vae_learning_rate <= 0:
+        raise ValueError("m1 learning rates must be positive")
+    if cfg.m1.vae_warmup_steps <= 0 or cfg.m1.max_steps <= 0:
+        raise ValueError("m1 VAE warmup/max steps must be positive")
+    if cfg.m1.vae_reconstruction_gate <= 0:
+        raise ValueError("m1.vae_reconstruction_gate must be positive")
+    if cfg.m1.checkpoint_every <= 0 or cfg.m1.log_every <= 0:
+        raise ValueError("m1 checkpoint/log intervals must be positive")
+    if cfg.m1.reconstruction_weight < 0 or cfg.m1.diffusion_weight <= 0:
+        raise ValueError("m1 loss weights must be non-negative with positive diffusion weight")
+    if cfg.m1.grad_clip <= 0:
+        raise ValueError("m1.grad_clip must be positive")
+    if not 1 <= cfg.m1.sampling_steps <= cfg.diffusion.timesteps:
+        raise ValueError("m1.sampling_steps must be in [1, diffusion.timesteps]")
+    if cfg.m1.eval_samples <= 0 or cfg.m1.eval_samples % 16 != 0:
+        raise ValueError("m1.eval_samples must be a positive multiple of 16")
+    if cfg.m1.eval_batch_size <= 0:
+        raise ValueError("m1.eval_batch_size must be positive")
+    if cfg.m1.static_motion_threshold <= 0:
+        raise ValueError("m1.static_motion_threshold must be positive")
+    if cfg.m1.prompt_contrast_weight < 0:
+        raise ValueError("m1.prompt_contrast_weight must be non-negative")
+    if cfg.m1.prompt_contrast_margin <= 0:
+        raise ValueError("m1.prompt_contrast_margin must be positive")
+    if cfg.m1.unconditional_loss_weight < 0:
+        raise ValueError("m1.unconditional_loss_weight must be non-negative")
+    if not 0.0 <= cfg.m1.high_noise_conditioning_fraction <= 1.0:
+        raise ValueError("m1.high_noise_conditioning_fraction must be in [0, 1]")
+    if not 0 <= cfg.m1.semantic_timestep < cfg.diffusion.timesteps:
+        raise ValueError("m1.semantic_timestep must be in [0, diffusion.timesteps)")
+    if cfg.m1.semantic_direction_weight < 0 or cfg.m1.semantic_color_weight < 0:
+        raise ValueError("m1 semantic loss weights must be non-negative")
+    if cfg.m1.semantic_min_motion <= 0:
+        raise ValueError("m1.semantic_min_motion must be positive")
+    if cfg.m1.guidance_scale < 1.0:
+        raise ValueError("m1.guidance_scale must be >= 1")
+    if not 0.0 < cfg.m1.generation_direction_gate <= 1.0:
+        raise ValueError("m1.generation_direction_gate must be in (0, 1]")
+    if not 0.0 < cfg.m1.generation_color_gate <= 1.0:
+        raise ValueError("m1.generation_color_gate must be in (0, 1]")
+    if not 0.0 <= cfg.m1.generation_static_rate_gate <= 1.0:
+        raise ValueError("m1.generation_static_rate_gate must be in [0, 1]")
+    if cfg.m1.generation_mean_motion_gate <= 0:
+        raise ValueError("m1.generation_mean_motion_gate must be positive")

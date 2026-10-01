@@ -26,7 +26,7 @@ Required:
 
 ## M1 gate — synthetic motion
 
-### Stage A — renderer and supervised temporal sanity
+### Stage A — renderer and supervised temporal sanity — passed
 
 Required before generative M1 training:
 
@@ -40,18 +40,73 @@ Required before generative M1 training:
 - color accuracy >= 0.95;
 - the probe checkpoint records config, optimizer, seed-space identifier and baseline/final metrics.
 
-The supervised probe is deliberately not used as evidence that the generative model follows controls. It only proves the synthetic temporal/appearance signal and label pipeline are learnable.
+Recorded RTX 5050 Stage-A evidence:
 
-### M1 final generative gate
+```text
+steps=300
+baseline_direction_accuracy=0.246094
+baseline_color_accuracy=0.250000
+direction_accuracy=0.984375
+color_accuracy=1.000000
+gate_passed=True
+```
 
-Dataset tests continue to require split determinism, trajectory/render agreement and no split leakage as the curriculum expands. Generative quality must then demonstrate:
+The supervised probe is deliberately not used as evidence that the generative model follows controls.
 
-- direction accuracy above a frozen generated baseline;
-- object/color/count accuracy measured from ground-truth synthetic renderer metadata;
-- temporal trajectory error improves materially over an untrained/random baseline;
-- generated motion does not collapse to static frames.
+### Stage B — generative synthetic motion — active
 
-Final generative thresholds are frozen only after the first reproducible baseline run. M2 remains blocked until that generated-video gate passes.
+Correctness requirements:
+
+- Stage-B uses one object, four directions, four colors, square/circle and fixed medium linear speed;
+- VAE reconstruction is measured separately and must pass the foreground-aware reconstruction safety gate before diffusion starts;
+- diffusion training predicts epsilon from noisy VAE latents conditioned through the project-owned byte tokenizer/text Transformer;
+- text conditioning includes pooled text plus parameter-free token-level attention using the existing learned text projection;
+- training compares the correct caption against one-word color and direction counterfactual captions and a null caption; no structured direction/color labels are fed into the denoiser;
+- corrective training deliberately oversamples the high-noise half of the diffusion schedule so prompt semantics cannot be bypassed by relying only on nearly-clean visual latents;
+- Video DiT receives explicit deterministic temporal/spatial patch positions;
+- training reports reconstruction loss, diffusion loss, total loss, gradient norm, counterfactual/null losses, color/direction prompt-loss gaps and decoded semantic direction/color losses;
+- Stage-B-v3 computes a differentiable soft-centroid motion loss on decoded predicted-clean video at a fixed noisy timestep, including a one-word direction-counterfactual target; semantic labels supervise the loss only and are not model inputs;
+- reverse diffusion starts from Gaussian latent noise and is deterministic for fixed model/config/seed;
+- final sampling uses the configured deterministic classifier-free guidance scale;
+- generated output has shape `[B, 3, T, H, W]` and is decoded through `TinyVideoVAE`;
+- `latest.pt` and `best.pt` contain VAE/text/DiT states, optimizer states, global/phase progress, config, seed, split/curriculum metadata, metrics and RNG/data-generator state;
+- resume restores model/optimizer/progress/RNG state rather than silently restarting;
+- CPU tests cover one optimization step, finite losses, gradients, sampler shape/determinism, checkpoint round-trip, resume and cardinal generated-video metric behavior.
+
+Evaluation protocol:
+
+- first record an untrained/random model using exactly the same generation/evaluation path;
+- use 64 generated videos for the frozen final candidate protocol;
+- balance the four directions and four colors;
+- use fixed test-split prompts/seeds;
+- use 50 deterministic reverse-diffusion steps for the final candidate;
+- measure direction from generated temporal motion;
+- measure color from generated RGB appearance;
+- report direction accuracy, color accuracy, mean motion, static rate and confusion matrices.
+- report the guidance scale and an explicit `gate_passed` result from the frozen thresholds.
+
+Requested labels are ground truth only. The evaluator must infer its answer from generated pixels and temporal movement.
+
+Frozen final M1 thresholds:
+
+```text
+direction_accuracy >= 0.75
+color_accuracy     >= 0.75
+static_rate        <= 0.10
+mean_motion        > 0.02
+```
+
+Stage-B v1 recorded a random baseline of direction `0.265625`, color `0.250000`, mean motion
+`0.009729`, static rate `1.000000`. Its trained `best.pt` reached direction `0.312500`, color
+`0.265625`, mean motion `0.136491`, static rate `0.000000`: motion/static collapse improved, but
+prompt control failed the frozen gate. Because the corrective v2 path changes text conditioning and
+uses classifier-free guidance, it must record a fresh random baseline with the same 64-sample/50-step
+v2 protocol before trained evaluation. The absolute thresholds above do not move. Training loss,
+VAE reconstruction, visually interesting samples or the Stage-A probe cannot complete M1. M2
+remains blocked until `gate_passed=True` on generated-video evidence and the result materially beats
+the corresponding v2 random baseline. Stage-B-v2 trained evaluation reached direction `0.265625`,
+color `0.703125`, mean motion `0.163834`, static rate `0.000000`; direction remained at chance, so v3
+adds decoded semantic direction supervision while preserving the same frozen absolute gate.
 
 ## M2 gate — VAE
 

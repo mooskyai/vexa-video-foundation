@@ -20,24 +20,63 @@ Deliverables:
 
 ## M1 — Synthetic motion world
 
-**Status:** active.
+**Status:** active. Stage A passed; Stage B active; M1 incomplete; M2 blocked.
 
-**Goal:** prove temporal learning before real video.
+**Goal:** prove controlled temporal generation before real video.
 
-M1 starts with a supervised sanity gate while keeping the M0 tokenizer/VAE/DiT/diffusion architecture intact. Stage A uses balanced cardinal controls (right/left/down/up), four colors, square/circle shapes, speed buckets, deterministic captions/trajectories and disjoint split seed spaces. A tiny project-trained motion probe must recover direction and color at >= 0.95 accuracy before generative optimization begins.
+### Stage A — complete
 
-Dataset curriculum then expands through:
+The deterministic renderer exposes cardinal motion, four colors, square/circle shapes and speed buckets with disjoint split seed spaces. The project-trained `MotionProbe` passed the frozen held-out gate on the RTX 5050 at 300 steps:
 
-- moving shapes;
-- acceleration and bounce;
-- rotation/scale;
-- occlusion;
-- multiple objects;
-- simple depth ordering;
-- camera pan/zoom simulation;
-- deterministic captions and ground-truth trajectories.
+```text
+baseline_direction_accuracy=0.246094
+baseline_color_accuracy=0.250000
+direction_accuracy=0.984375
+color_accuracy=1.000000
+gate_passed=True
+```
 
-Exit result: generated clips show measurable motion learning rather than independent-frame noise. The supervised probe is a prerequisite, not the M1 completion criterion.
+This only establishes renderer/label learnability.
+
+### Stage B — active
+
+The first generative curriculum is deliberately narrower: one object, four directions, four colors, square/circle, constant medium linear velocity, static camera, 8 frames and 32x32 RGB. The existing `TinyVideoVAE`, `TransformerTextEncoder`, `VideoDiT` and diffusion schedule remain the model path. Stage B adds:
+
+- foreground-aware VAE reconstruction warmup and a safety gate before diffusion training;
+- deterministic 3D Fourier patch positions in `VideoDiT` so temporal/spatial tokens are distinguishable;
+- epsilon-prediction training with reconstruction/diffusion/total loss and gradient norm tracking;
+- deterministic reduced-step reverse diffusion from Gaussian latent noise;
+- resumable composite checkpoints with VAE/text/DiT/optimizer/RNG/config/dataset state;
+- generated-RGB direction, color, mean-motion, static-rate and confusion-matrix evaluation;
+- a frozen random-model evaluation path using the same prompts/seeds/protocol as trained checkpoints.
+
+The first GPU baseline proved motion learning but not prompt adherence. Random -> trained metrics were
+direction `0.265625 -> 0.312500`, color `0.250000 -> 0.265625`, mean motion
+`0.009729 -> 0.136491`, static rate `1.000000 -> 0.000000`. Stage B therefore remains active.
+
+The corrective conditioning experiment stays inside Stage B and adds:
+
+- parameter-free token-level attention in the existing projected text space, preserving Stage-B v1 checkpoint compatibility;
+- correct-vs-color-counterfactual and correct-vs-direction-counterfactual text objectives so the denoiser cannot minimize epsilon loss while ignoring prompt words;
+- an explicit null-caption denoising objective for classifier-free guidance;
+- high-noise timestep oversampling during corrective training so captions are useful when the latent itself is ambiguous;
+- deterministic classifier-free guided sampling (`guidance_scale=3.0` in `tiny.toml`);
+- held-out color/direction prompt-gap penalties in `best.pt` selection;
+- frozen generated-video thresholds in configuration and an explicit `gate_passed` metric.
+
+No structured control labels are fed to the denoiser; captions remain the conditioning interface.
+The v2 random baseline must be recorded before corrective training because the generation protocol
+changed. The frozen absolute gate remains direction >= 0.75, color >= 0.75, static <= 0.10 and mean
+motion > 0.02. Complete generated videos are authoritative.
+
+Stage-B-v2 improved color accuracy to `0.703125` and retained strong motion (`0.163834`, static rate
+`0.000000`) but direction stayed at chance (`0.265625`). Stage-B-v3 remains inside M1 and adds a
+decoded predicted-clean semantic objective: soft-centroid motion must follow the caption direction, and
+a direction-counterfactual caption must reverse/reorient motion under the same noisy latent. A smaller
+decoded color objective protects the nearly-passing color control. This changes training loss only;
+caption text remains the sole conditioning input and the v2 checkpoint remains model/optimizer compatible.
+
+The broader synthetic curriculum (bounce, acceleration, rotation/scale, occlusion, multiple objects and camera motion) remains deferred until this narrow generator works.
 
 ## M2 — Video autoencoder v1
 

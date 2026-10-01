@@ -4,6 +4,7 @@ import math
 from typing import cast
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 
 
@@ -19,6 +20,60 @@ def timestep_embedding(timesteps: Tensor, dim: int, max_period: int = 10_000) ->
     if dim % 2:
         embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
     return embedding
+
+
+def spatiotemporal_position_embedding(
+    grid: tuple[int, int, int],
+    dim: int,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Tensor:
+    """Create deterministic 3D Fourier features for temporal/spatial patch positions."""
+    frames, height, width = grid
+    axes = [
+        torch.linspace(-1.0, 1.0, steps=size, device=device, dtype=torch.float32)
+        for size in (frames, height, width)
+    ]
+    tt, yy, xx = torch.meshgrid(*axes, indexing="ij")
+    coordinates = torch.stack((tt, yy, xx), dim=-1).reshape(-1, 3)
+    bands = max(1, math.ceil(dim / 6))
+    frequencies = math.pi * torch.pow(
+        2.0,
+        torch.arange(bands, device=device, dtype=torch.float32),
+    )
+    phases = coordinates.unsqueeze(-1) * frequencies
+    features = torch.cat((torch.sin(phases), torch.cos(phases)), dim=-1).reshape(
+        coordinates.shape[0], -1
+    )
+    if features.shape[1] < dim:
+        padding = torch.zeros(
+            features.shape[0],
+            dim - features.shape[1],
+            device=device,
+            dtype=features.dtype,
+        )
+        features = torch.cat((features, padding), dim=-1)
+    return features[:, :dim].to(dtype=dtype).unsqueeze(0)
+
+
+def token_text_attention(video_tokens: Tensor, text_tokens: Tensor, text_mask: Tensor) -> Tensor:
+    """Parameter-free token attention using the existing learned text projection space."""
+    if video_tokens.ndim != 3 or text_tokens.ndim != 3:
+        raise ValueError("video_tokens and text_tokens must be rank-3 tensors")
+    if text_mask.shape != text_tokens.shape[:2]:
+        raise ValueError("text_mask must have shape [B, L]")
+    if video_tokens.shape[0] != text_tokens.shape[0]:
+        raise ValueError("video/text batch sizes must match")
+    if not bool(text_mask.any(dim=1).all().item()):
+        raise ValueError("every text sequence must contain at least one unmasked token")
+
+    query = F.normalize(video_tokens, dim=-1)
+    key = F.normalize(text_tokens, dim=-1)
+    scores = torch.matmul(query, key.transpose(1, 2)) * 4.0
+    scores = scores.masked_fill(~text_mask.unsqueeze(1), torch.finfo(scores.dtype).min)
+    weights = torch.softmax(scores, dim=-1)
+    return torch.matmul(weights, text_tokens)
 
 
 class VideoDiT(nn.Module):
@@ -80,16 +135,28 @@ class VideoDiT(nn.Module):
             raise ValueError("latent dimensions must be divisible by patch size")
 
         patches = self.patch_embed(latents)
-        grid = patches.shape[2:]
+        grid = cast(tuple[int, int, int], tuple(patches.shape[2:]))
         tokens = patches.flatten(2).transpose(1, 2)
+        positions = spatiotemporal_position_embedding(
+            grid,
+            tokens.shape[-1],
+            device=tokens.device,
+            dtype=tokens.dtype,
+        )
 
         time_cond = self.time_mlp(timestep_embedding(timesteps, tokens.shape[-1])).unsqueeze(1)
-        mask = text_mask.to(dtype=text_tokens.dtype).unsqueeze(-1)
+        projected_text = F.layer_norm(
+            self.text_proj(text_tokens),
+            (tokens.shape[-1],),
+        )
+        mask = text_mask.to(dtype=projected_text.dtype).unsqueeze(-1)
         denom = mask.sum(dim=1).clamp_min(1.0)
-        pooled_text = (text_tokens * mask).sum(dim=1) / denom
-        text_cond = self.text_proj(pooled_text).unsqueeze(1)
-        tokens = tokens + time_cond + text_cond
+        pooled_text = (projected_text * mask).sum(dim=1) / denom
+        text_cond = pooled_text.unsqueeze(1)
+        token_cond = token_text_attention(tokens, projected_text, text_mask)
+        tokens = tokens + positions + time_cond + text_cond + token_cond
         tokens = self.blocks(tokens)
+        tokens = tokens + token_text_attention(tokens, projected_text, text_mask)
         tokens = self.out(self.norm(tokens))
 
         tokens = tokens.view(batch, grid[0], grid[1], grid[2], channels, pt, ph, pw)

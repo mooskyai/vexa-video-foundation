@@ -1,3 +1,4 @@
+from .stage_b import StageBSyntheticDataset, stage_b_control
 from .synthetic import (
     COLORS,
     DIRECTIONS,
@@ -15,9 +16,11 @@ __all__ = [
     "DIRECTIONS",
     "SHAPES",
     "SPEED_BUCKETS",
+    "StageBSyntheticDataset",
     "SyntheticControl",
     "SyntheticMotionDataset",
     "SyntheticSample",
     "render_motion_sample",
     "render_moving_square",
+    "stage_b_control",
 ]
