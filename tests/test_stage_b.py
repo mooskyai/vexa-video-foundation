@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from vexa_video.config import load_config
+from vexa_video.config import ProjectConfig, load_config
 from vexa_video.data import StageBSyntheticDataset
 from vexa_video.inference import sample_video
 from vexa_video.inference.sampler import guided_ddim_rollout
@@ -26,7 +26,7 @@ from vexa_video.training.stage_b import (
 )
 
 
-def _tiny_test_config():
+def _tiny_test_config() -> ProjectConfig:
     cfg = load_config(Path(__file__).parents[1] / "configs" / "tiny.toml")
     return replace(
         cfg,
@@ -185,21 +185,45 @@ def test_sampler_shape_and_fixed_seed_determinism() -> None:
     cfg = _tiny_test_config()
     torch.manual_seed(3)
     components = build_stage_b_components(cfg, device=torch.device("cpu"))
-    kwargs = dict(
+    prompts = ["a red square moves right at medium speed"]
+    device = torch.device("cpu")
+    first = sample_video(
         cfg=cfg,
         tokenizer=components.tokenizer,
         text_encoder=components.text_encoder,
         vae=components.vae,
         dit=components.dit,
         schedule=components.schedule,
-        prompts=["a red square moves right at medium speed"],
+        prompts=prompts,
         seed=123,
         sampling_steps=2,
-        device=torch.device("cpu"),
+        device=device,
     )
-    first = sample_video(**kwargs)
-    second = sample_video(**kwargs)
-    unguided = sample_video(**kwargs, guidance_scale=1.0)
+    second = sample_video(
+        cfg=cfg,
+        tokenizer=components.tokenizer,
+        text_encoder=components.text_encoder,
+        vae=components.vae,
+        dit=components.dit,
+        schedule=components.schedule,
+        prompts=prompts,
+        seed=123,
+        sampling_steps=2,
+        device=device,
+    )
+    unguided = sample_video(
+        cfg=cfg,
+        tokenizer=components.tokenizer,
+        text_encoder=components.text_encoder,
+        vae=components.vae,
+        dit=components.dit,
+        schedule=components.schedule,
+        prompts=prompts,
+        seed=123,
+        sampling_steps=2,
+        guidance_scale=1.0,
+        device=device,
+    )
     assert first.shape == (1, 3, cfg.data.frames, cfg.data.height, cfg.data.width)
     assert torch.equal(first, second)
     assert not torch.equal(first, unguided)
@@ -240,7 +264,7 @@ def test_guided_ddim_rollout_preserves_training_gradients() -> None:
         ),
         guidance_scale=cfg.m1.guidance_scale,
     )
-    rolled.square().mean().backward()
+    torch.autograd.backward(rolled.square().mean())
     assert any(parameter.grad is not None for parameter in components.text_encoder.parameters())
     assert any(parameter.grad is not None for parameter in components.dit.parameters())
 
