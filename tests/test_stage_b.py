@@ -9,6 +9,7 @@ import torch
 from vexa_video.config import load_config
 from vexa_video.data import StageBSyntheticDataset
 from vexa_video.inference import sample_video
+from vexa_video.inference.sampler import guided_ddim_rollout
 from vexa_video.models.dit import spatiotemporal_position_embedding, token_text_attention
 from vexa_video.training.checkpoint import build_stage_b_checkpoint
 from vexa_video.training.m1_evaluation import (
@@ -41,6 +42,8 @@ def _tiny_test_config():
             eval_samples=16,
             eval_batch_size=1,
             semantic_timestep=10,
+            rollout_steps=2,
+            rollout_batch_size=1,
         ),
     )
 
@@ -149,6 +152,46 @@ def test_sampler_shape_and_fixed_seed_determinism() -> None:
     assert first.shape == (1, 3, cfg.data.frames, cfg.data.height, cfg.data.width)
     assert torch.equal(first, second)
     assert not torch.equal(first, unguided)
+
+
+def test_guided_ddim_rollout_preserves_training_gradients() -> None:
+    cfg = _tiny_test_config()
+    components = build_stage_b_components(cfg, device=torch.device("cpu"))
+    prompt = ["a red square moves right at medium speed"]
+    conditional = components.tokenizer.batch(prompt, cfg.text.max_length)
+    unconditional = components.tokenizer.batch([""], cfg.text.max_length)
+    conditional_text = components.text_encoder(
+        conditional.input_ids,
+        conditional.attention_mask,
+    )
+    unconditional_text = components.text_encoder(
+        unconditional.input_ids,
+        unconditional.attention_mask,
+    )
+    latents = torch.randn(
+        1,
+        cfg.vae.latent_channels,
+        cfg.data.frames // cfg.vae.temporal_downsample,
+        cfg.data.height // cfg.vae.spatial_downsample,
+        cfg.data.width // cfg.vae.spatial_downsample,
+    )
+    rolled = guided_ddim_rollout(
+        latents=latents,
+        dit=components.dit,
+        schedule=components.schedule,
+        conditional_text=conditional_text,
+        conditional_mask=conditional.attention_mask,
+        unconditional_text=unconditional_text,
+        unconditional_mask=unconditional.attention_mask,
+        sampling_timesteps=components.schedule.sampling_timesteps(
+            cfg.m1.rollout_steps,
+            device=torch.device("cpu"),
+        ),
+        guidance_scale=cfg.m1.guidance_scale,
+    )
+    rolled.square().mean().backward()
+    assert any(parameter.grad is not None for parameter in components.text_encoder.parameters())
+    assert any(parameter.grad is not None for parameter in components.dit.parameters())
 
 
 def test_generated_metrics_identify_cardinal_synthetic_videos() -> None:

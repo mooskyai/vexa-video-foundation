@@ -14,6 +14,7 @@ from torch import Tensor
 from vexa_video.config import ProjectConfig
 from vexa_video.data import COLORS, DIRECTIONS, StageBSyntheticDataset
 from vexa_video.diffusion import LinearNoiseSchedule
+from vexa_video.inference.sampler import guided_ddim_rollout
 from vexa_video.models import ByteTokenizer, TinyVideoVAE, TransformerTextEncoder, VideoDiT
 from vexa_video.training.checkpoint import build_stage_b_checkpoint
 
@@ -147,6 +148,16 @@ def _counterfactual_caption(caption: str, vocabulary: tuple[str, ...]) -> str:
     raise ValueError(f"caption does not contain any expected term from {vocabulary}: {caption}")
 
 
+def _caption_with_direction(caption: str, direction: str) -> str:
+    if direction not in DIRECTIONS:
+        raise ValueError(f"unknown direction: {direction}")
+    for word in DIRECTIONS:
+        marker = f" {word} "
+        if marker in caption:
+            return caption.replace(marker, f" {direction} ", 1)
+    raise ValueError(f"caption does not contain a direction term: {caption}")
+
+
 def _conditioning_predictions(
     *,
     components: StageBComponents,
@@ -232,6 +243,72 @@ def _motion_target_loss(motion: Tensor, target: Tensor, minimum_motion: float) -
     return (alignment + F.relu(minimum_motion - magnitude)).mean()
 
 
+def _sampler_aligned_direction_loss(
+    *,
+    components: StageBComponents,
+    clean_latents: Tensor,
+    captions: list[str],
+    cfg: ProjectConfig,
+    device: torch.device,
+    initial_noise: Tensor,
+) -> Tensor:
+    batch = min(cfg.m1.rollout_batch_size, clean_latents.shape[0], len(captions))
+    if batch <= 0:
+        return clean_latents.new_zeros(())
+
+    base_captions = captions[:batch]
+    rollout_captions = [
+        _caption_with_direction(caption, direction)
+        for caption in base_captions
+        for direction in DIRECTIONS
+    ]
+    conditional_tokens = components.tokenizer.batch(
+        rollout_captions,
+        cfg.text.max_length,
+        device=device,
+    )
+    unconditional_tokens = components.tokenizer.batch(
+        [""] * len(rollout_captions),
+        cfg.text.max_length,
+        device=device,
+    )
+    conditional_text = components.text_encoder(
+        conditional_tokens.input_ids,
+        conditional_tokens.attention_mask,
+    )
+    unconditional_text = components.text_encoder(
+        unconditional_tokens.input_ids,
+        unconditional_tokens.attention_mask,
+    )
+    rollout_noise = initial_noise[:batch].repeat_interleave(len(DIRECTIONS), dim=0)
+    rollout_latents = guided_ddim_rollout(
+        latents=rollout_noise,
+        dit=components.dit,
+        schedule=components.schedule,
+        conditional_text=conditional_text,
+        conditional_mask=conditional_tokens.attention_mask,
+        unconditional_text=unconditional_text,
+        unconditional_mask=unconditional_tokens.attention_mask,
+        sampling_timesteps=components.schedule.sampling_timesteps(
+            cfg.m1.rollout_steps,
+            device=device,
+        ),
+        guidance_scale=cfg.m1.guidance_scale,
+    )
+    rollout_video = components.vae.decode(rollout_latents)
+    rollout_motion, _ = _soft_video_features(rollout_video)
+    direction_targets = torch.tensor(
+        [_DIRECTION_TARGETS[direction] for _ in base_captions for direction in DIRECTIONS],
+        device=device,
+        dtype=clean_latents.dtype,
+    )
+    return _motion_target_loss(
+        rollout_motion,
+        direction_targets,
+        cfg.m1.semantic_min_motion,
+    )
+
+
 def _semantic_conditioning_losses(
     *,
     components: StageBComponents,
@@ -309,6 +386,15 @@ def _semantic_conditioning_losses(
         F.mse_loss(correct_color, color_target)
         + F.mse_loss(counterfactual_color, color_counterfactual_target)
     )
+    rollout_direction_loss = _sampler_aligned_direction_loss(
+        components=components,
+        clean_latents=clean_latents,
+        captions=captions,
+        cfg=cfg,
+        device=device,
+        initial_noise=semantic_noise,
+    )
+    direction_loss = direction_loss + cfg.m1.rollout_direction_weight * rollout_direction_loss
     return direction_loss, color_loss
 
 

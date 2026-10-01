@@ -83,6 +83,9 @@ class M1Config:
     semantic_direction_weight: float = 2.0
     semantic_color_weight: float = 0.5
     semantic_min_motion: float = 0.10
+    rollout_steps: int = 4
+    rollout_batch_size: int = 1
+    rollout_direction_weight: float = 1.0
     guidance_scale: float = 3.0
     generation_direction_gate: float = 0.75
     generation_color_gate: float = 0.75
@@ -197,6 +200,12 @@ def validate_config(cfg: ProjectConfig) -> None:
         raise ValueError("m1 semantic loss weights must be non-negative")
     if cfg.m1.semantic_min_motion <= 0:
         raise ValueError("m1.semantic_min_motion must be positive")
+    if not 1 <= cfg.m1.rollout_steps <= cfg.diffusion.timesteps:
+        raise ValueError("m1.rollout_steps must be in [1, diffusion.timesteps]")
+    if cfg.m1.rollout_batch_size <= 0:
+        raise ValueError("m1.rollout_batch_size must be positive")
+    if cfg.m1.rollout_direction_weight < 0:
+        raise ValueError("m1.rollout_direction_weight must be non-negative")
     if cfg.m1.guidance_scale < 1.0:
         raise ValueError("m1.guidance_scale must be >= 1")
     if not 0.0 < cfg.m1.generation_direction_gate <= 1.0:

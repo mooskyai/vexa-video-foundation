@@ -8,6 +8,57 @@ from vexa_video.diffusion import LinearNoiseSchedule
 from vexa_video.models import ByteTokenizer, TinyVideoVAE, TransformerTextEncoder, VideoDiT
 
 
+def guided_ddim_rollout(
+    *,
+    latents: Tensor,
+    dit: VideoDiT,
+    schedule: LinearNoiseSchedule,
+    conditional_text: Tensor,
+    conditional_mask: Tensor,
+    unconditional_text: Tensor,
+    unconditional_mask: Tensor,
+    sampling_timesteps: Tensor,
+    guidance_scale: float,
+) -> Tensor:
+    """Run the same classifier-free-guided DDIM path used by inference."""
+    if guidance_scale < 1.0:
+        raise ValueError("guidance_scale must be >= 1")
+    batch = latents.shape[0]
+    if conditional_text.shape[0] != batch or unconditional_text.shape[0] != batch:
+        raise ValueError("text batch size must match latent batch size")
+    model_text = torch.cat((unconditional_text, conditional_text), dim=0)
+    model_mask = torch.cat((unconditional_mask, conditional_mask), dim=0)
+
+    for index, timestep_tensor in enumerate(sampling_timesteps):
+        timestep = int(timestep_tensor.item())
+        previous_timestep = (
+            int(sampling_timesteps[index + 1].item()) if index + 1 < len(sampling_timesteps) else -1
+        )
+        timestep_batch = torch.full(
+            (batch,),
+            timestep,
+            dtype=torch.long,
+            device=latents.device,
+        )
+        predicted_noise = dit(
+            torch.cat((latents, latents), dim=0),
+            torch.cat((timestep_batch, timestep_batch), dim=0),
+            model_text,
+            model_mask,
+        )
+        unconditional_noise, conditional_noise = predicted_noise.chunk(2, dim=0)
+        guided_noise = unconditional_noise + guidance_scale * (
+            conditional_noise - unconditional_noise
+        )
+        latents = schedule.ddim_step(
+            latents,
+            guided_noise,
+            timestep=timestep,
+            previous_timestep=previous_timestep,
+        )
+    return latents
+
+
 def sample_video(
     *,
     cfg: ProjectConfig,
@@ -55,38 +106,16 @@ def sample_video(
             unconditional_tokens.input_ids,
             unconditional_tokens.attention_mask,
         )
-        model_text = torch.cat((unconditional_text, conditional_text), dim=0)
-        model_mask = torch.cat(
-            (unconditional_tokens.attention_mask, conditional_tokens.attention_mask), dim=0
+        latents = guided_ddim_rollout(
+            latents=latents,
+            dit=dit,
+            schedule=schedule,
+            conditional_text=conditional_text,
+            conditional_mask=conditional_tokens.attention_mask,
+            unconditional_text=unconditional_text,
+            unconditional_mask=unconditional_tokens.attention_mask,
+            sampling_timesteps=sampling_timesteps,
+            guidance_scale=guidance,
         )
-        for index, timestep_tensor in enumerate(sampling_timesteps):
-            timestep = int(timestep_tensor.item())
-            previous_timestep = (
-                int(sampling_timesteps[index + 1].item())
-                if index + 1 < len(sampling_timesteps)
-                else -1
-            )
-            timestep_batch = torch.full(
-                (len(prompts),),
-                timestep,
-                dtype=torch.long,
-                device=device,
-            )
-            predicted_noise = dit(
-                torch.cat((latents, latents), dim=0),
-                torch.cat((timestep_batch, timestep_batch), dim=0),
-                model_text,
-                model_mask,
-            )
-            unconditional_noise, conditional_noise = predicted_noise.chunk(2, dim=0)
-            predicted_noise = unconditional_noise + guidance * (
-                conditional_noise - unconditional_noise
-            )
-            latents = schedule.ddim_step(
-                latents,
-                predicted_noise,
-                timestep=timestep,
-                previous_timestep=previous_timestep,
-            )
         video = vae.decode(latents)
     return video.clamp(-1.0, 1.0)

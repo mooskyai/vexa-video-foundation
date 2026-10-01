@@ -175,6 +175,15 @@ Stage-B-v3 resumes the v2 `best.pt` without changing model parameters or optimiz
 validation selector resets because the score now includes held-out decoded direction/color semantic
 losses. The corrective target is extended to 8000 diffusion steps.
 
+The completed Stage-B-v3 generated-video evaluation passed color (`0.781250`), mean-motion
+(`0.139715`) and static-rate (`0.000000`) gates, but direction remained at chance (`0.250000`).
+Stage-B-v4 therefore adds sampler-aligned direction supervision: a small training sub-batch starts
+from Gaussian latent noise, runs the same classifier-free-guided DDIM implementation used by
+inference for a short differentiable rollout, decodes the result, and applies the existing soft
+cardinal-motion loss. All four direction captions share the same starting noise, so the caption must
+cause the motion difference. This is a training-only correction; the frozen 50-step evaluation path,
+guidance scale and M1 thresholds do not change. The v4 target is 10000 diffusion steps.
+
 Because the corrective path changes the generation protocol (token attention + guidance), record
 a fresh random baseline before corrective training. The absolute M1 thresholds do not change:
 
