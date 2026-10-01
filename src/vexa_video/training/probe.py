@@ -122,7 +122,7 @@ def train_m1_probe(
         torch.autograd.backward(loss)
         optimizer.step()
         if step == 1 or step % log_every == 0 or step == target_steps:
-            print(f"m1_probe step={step} loss={float(loss.detach().item()):.6f}")
+            print(f"probe step={step} loss={float(loss.detach().item()):.6f}")
 
     direction_accuracy, color_accuracy = _accuracy(
         model,
@@ -138,7 +138,7 @@ def train_m1_probe(
     output_dir = Path(run_dir)
     checkpoints_dir = output_dir / "checkpoints"
     checkpoints_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint = checkpoints_dir / "m1-probe.pt"
+    checkpoint = checkpoints_dir / "probe.pt"
     torch.save(
         build_checkpoint(
             model=model,

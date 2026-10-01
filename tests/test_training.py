@@ -11,12 +11,12 @@ from vexa_video.data import StageBSyntheticDataset
 from vexa_video.inference import sample_video
 from vexa_video.inference.sampler import guided_ddim_rollout
 from vexa_video.models.dit import spatiotemporal_position_embedding, token_text_attention
-from vexa_video.training.checkpoint import build_stage_b_checkpoint
-from vexa_video.training.m1_evaluation import (
+from vexa_video.training.checkpoint import build_training_checkpoint
+from vexa_video.training.evaluation import (
     evaluate_generated_videos,
     passes_m1_generation_gate,
 )
-from vexa_video.training.stage_b import (
+from vexa_video.training.trainer import (
     _normalize_cuda_rng_states,
     _soft_video_features,
     _validation_generation_metrics,
@@ -52,7 +52,7 @@ def _tiny_test_config() -> ProjectConfig:
     )
 
 
-def test_stage_b_curriculum_is_fixed_medium_and_balanced() -> None:
+def test_controlled_motion_curriculum_is_fixed_medium_and_balanced() -> None:
     dataset = StageBSyntheticDataset(
         length=32,
         frames=8,
@@ -292,7 +292,7 @@ def test_generated_metrics_identify_cardinal_synthetic_videos() -> None:
     assert passes_m1_generation_gate(metrics, _tiny_test_config())
 
 
-def test_stage_b_checkpoint_round_trip(tmp_path: Path) -> None:
+def test_training_checkpoint_round_trip(tmp_path: Path) -> None:
     cfg = _tiny_test_config()
     device = torch.device("cpu")
     components = build_stage_b_components(cfg, device=device)
@@ -302,7 +302,7 @@ def test_stage_b_checkpoint_round_trip(tmp_path: Path) -> None:
         lr=cfg.m1.learning_rate,
     )
     generator = torch.Generator().manual_seed(9)
-    checkpoint = build_stage_b_checkpoint(
+    checkpoint = build_training_checkpoint(
         vae=components.vae,
         text_encoder=components.text_encoder,
         dit=components.dit,
@@ -327,7 +327,7 @@ def test_stage_b_checkpoint_round_trip(tmp_path: Path) -> None:
 
 
 def test_train_resume_restores_progress(tmp_path: Path) -> None:
-    from vexa_video.training.stage_b import train_stage_b
+    from vexa_video.training.trainer import train_stage_b
 
     cfg = _tiny_test_config()
     cfg = replace(

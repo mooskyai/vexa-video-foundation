@@ -1,7 +1,7 @@
-from .checkpoint import build_checkpoint, build_stage_b_checkpoint
-from .m1_evaluation import M1GenerationMetrics, evaluate_m1_generation
-from .m1_probe import M1ProbeResult, train_m1_probe
-from .stage_b import (
+from .checkpoint import build_checkpoint, build_training_checkpoint
+from .evaluation import M1GenerationMetrics, evaluate_m1_generation
+from .probe import M1ProbeResult, train_m1_probe
+from .trainer import (
     StageBComponents,
     StageBStepMetrics,
     StageBTrainResult,
@@ -20,8 +20,8 @@ __all__ = [
     "StageBStepMetrics",
     "StageBTrainResult",
     "build_checkpoint",
-    "build_stage_b_checkpoint",
     "build_stage_b_components",
+    "build_training_checkpoint",
     "diffusion_train_step",
     "evaluate_m1_generation",
     "load_stage_b_weights",

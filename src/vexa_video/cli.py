@@ -125,7 +125,7 @@ def cmd_synth(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_m1_probe(args: argparse.Namespace) -> int:
+def cmd_probe(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
     seed_everything(cfg.seed)
     device = _device_from_args(args)
@@ -165,7 +165,7 @@ def cmd_train(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_evaluate_m1(args: argparse.Namespace) -> int:
+def cmd_evaluate(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
     seed_everything(cfg.seed)
     device = _device_from_args(args)
@@ -275,28 +275,28 @@ def build_parser() -> argparse.ArgumentParser:
     smoke.add_argument("--cuda", action="store_true", help="Use CUDA when available")
     smoke.set_defaults(func=cmd_smoke)
 
-    m1_probe = sub.add_parser(
-        "m1-probe",
-        help="Train the supervised M1 temporal/color sanity probe",
+    probe = sub.add_parser(
+        "probe",
+        help="Train the supervised synthetic-motion sanity probe",
     )
-    m1_probe.add_argument("--config", default="configs/tiny.toml")
-    m1_probe.add_argument("--run-dir", default="runs/m1-probe")
-    m1_probe.add_argument("--steps", type=int, help="Override configured probe steps")
-    m1_probe.add_argument("--cuda", action="store_true", help="Require CUDA")
-    m1_probe.set_defaults(func=cmd_m1_probe)
+    probe.add_argument("--config", default="configs/tiny.toml")
+    probe.add_argument("--run-dir", default="runs/probe")
+    probe.add_argument("--steps", type=int, help="Override configured probe steps")
+    probe.add_argument("--cuda", action="store_true", help="Require CUDA")
+    probe.set_defaults(func=cmd_probe)
 
-    train = sub.add_parser("train", help="Train M1 Stage-B generative synthetic motion")
+    train = sub.add_parser("train", help="Train the synthetic-motion generator")
     train.add_argument("--config", default="configs/tiny.toml")
-    train.add_argument("--run-dir", default="runs/m1-stage-b")
+    train.add_argument("--run-dir", default="runs/synthetic-motion")
     train.add_argument("--steps", type=int, help="Override configured diffusion steps")
-    train.add_argument("--resume", help="Resume a Stage-B checkpoint")
+    train.add_argument("--resume", help="Resume a synthetic-motion checkpoint")
     train.add_argument("--cuda", action="store_true", help="Require CUDA")
     train.set_defaults(func=cmd_train)
 
-    evaluate = sub.add_parser("evaluate-m1", help="Evaluate complete generated M1 videos")
+    evaluate = sub.add_parser("evaluate", help="Evaluate generated synthetic-motion videos")
     evaluate.add_argument("--config", default="configs/tiny.toml")
     evaluation_source = evaluate.add_mutually_exclusive_group(required=True)
-    evaluation_source.add_argument("--checkpoint", help="Stage-B checkpoint to evaluate")
+    evaluation_source.add_argument("--checkpoint", help="Synthetic-motion checkpoint to evaluate")
     evaluation_source.add_argument(
         "--random-baseline",
         action="store_true",
@@ -306,9 +306,11 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--sampling-steps", type=int, help="Reverse diffusion steps")
     evaluate.add_argument("--output", help="Optional metrics JSON path")
     evaluate.add_argument("--cuda", action="store_true", help="Require CUDA")
-    evaluate.set_defaults(func=cmd_evaluate_m1)
+    evaluate.set_defaults(func=cmd_evaluate)
 
-    generate = sub.add_parser("generate", help="Generate a video from a Stage-B checkpoint")
+    generate = sub.add_parser(
+        "generate", help="Generate a video from a synthetic-motion checkpoint"
+    )
     generate.add_argument("--config", default="configs/tiny.toml")
     generate.add_argument("--checkpoint", required=True)
     generate.add_argument("--prompt", required=True)

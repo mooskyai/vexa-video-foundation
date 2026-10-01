@@ -10,7 +10,7 @@ from torch import Tensor
 from vexa_video.config import ProjectConfig
 from vexa_video.data import COLORS, DIRECTIONS, StageBSyntheticDataset, SyntheticControl
 from vexa_video.inference import sample_video
-from vexa_video.training.stage_b import StageBComponents
+from vexa_video.training.trainer import StageBComponents
 
 _COLOR_PROTOTYPES: dict[str, tuple[float, float, float]] = {
     "red": (1.0, -0.65, -0.65),
@@ -176,7 +176,7 @@ def evaluate_m1_generation(
     output: str | Path | None = None,
 ) -> M1GenerationMetrics:
     if cfg.data.height != cfg.data.width:
-        raise ValueError("M1 Stage-B evaluation currently requires square video dimensions")
+        raise ValueError("M1 evaluation currently requires square video dimensions")
     sample_count = samples if samples is not None else cfg.m1.eval_samples
     steps = sampling_steps if sampling_steps is not None else cfg.m1.sampling_steps
     if sample_count <= 0 or sample_count % 16 != 0:

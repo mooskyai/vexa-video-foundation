@@ -31,7 +31,7 @@ def build_checkpoint(
     return payload
 
 
-def build_stage_b_checkpoint(
+def build_training_checkpoint(
     *,
     vae: nn.Module,
     text_encoder: nn.Module,

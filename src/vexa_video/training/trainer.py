@@ -16,7 +16,7 @@ from vexa_video.data import COLORS, DIRECTIONS, StageBSyntheticDataset, Syntheti
 from vexa_video.diffusion import LinearNoiseSchedule
 from vexa_video.inference.sampler import guided_ddim_rollout, sample_video
 from vexa_video.models import ByteTokenizer, TinyVideoVAE, TransformerTextEncoder, VideoDiT
-from vexa_video.training.checkpoint import build_stage_b_checkpoint
+from vexa_video.training.checkpoint import build_training_checkpoint
 
 
 @dataclass(slots=True)
@@ -662,7 +662,7 @@ def _validation_generation_metrics(
     device: torch.device,
 ) -> tuple[float, float, float, float]:
     """Measure fixed validation-split generation at the full frozen sampler horizon."""
-    from vexa_video.training.m1_evaluation import evaluate_generated_videos
+    from vexa_video.training.evaluation import evaluate_generated_videos
 
     dataset = StageBSyntheticDataset(
         length=cfg.m1.validation_generation_samples,
@@ -752,11 +752,6 @@ def _restore_checkpoint(
     vae_step = int(payload.get("vae_step", 0))
     diffusion_step = int(payload.get("diffusion_step", 0))
     best_validation_score = float(payload.get("best_validation_score", math.inf))
-    stored_config = payload.get("config", {})
-    stored_m1 = stored_config.get("m1", {}) if isinstance(stored_config, dict) else {}
-    if not isinstance(stored_m1, dict) or "prompt_contrast_weight" not in stored_m1:
-        best_validation_score = math.inf
-        print("m1_stage_b resume_revision=conditioning-v2 reset_best_validation_score=true")
     phase = str(payload.get("phase", "vae_warmup"))
     return vae_step, diffusion_step, best_validation_score, phase
 
@@ -776,7 +771,7 @@ def _save_checkpoint(
     data_generator: torch.Generator,
 ) -> None:
     metric_payload = asdict(metrics) if isinstance(metrics, StageBStepMetrics) else metrics
-    checkpoint = build_stage_b_checkpoint(
+    checkpoint = build_training_checkpoint(
         vae=components.vae,
         text_encoder=components.text_encoder,
         dit=components.dit,
@@ -867,15 +862,14 @@ def train_stage_b(
             "config", {}
         )
         resume_m1 = raw_resume_config.get("m1", {}) if isinstance(raw_resume_config, dict) else {}
-        if not isinstance(resume_m1, dict) or "semantic_direction_weight" not in resume_m1:
+        current_selector_keys = {
+            "full_rollout_color_weight",
+            "full_rollout_min_motion",
+            "validation_generation_samples",
+        }
+        if not isinstance(resume_m1, dict) or not current_selector_keys.issubset(resume_m1):
             best_validation_score = math.inf
-            print("m1_stage_b resume_revision=semantic-v3 reset_best_validation_score=true")
-        elif "full_rollout_color_weight" not in resume_m1:
-            best_validation_score = math.inf
-            print(
-                "m1_stage_b resume_revision=balanced-full-horizon-v5 "
-                "reset_best_validation_score=true"
-            )
+            print("training resume_objective_changed reset_best_validation_score=true")
         print(
             "m1_stage_b resumed "
             f"checkpoint={resume_path} phase={phase} vae_step={vae_step} "
@@ -1137,7 +1131,7 @@ def load_stage_b_weights(
     components: StageBComponents,
     device: torch.device,
 ) -> dict[str, Any]:
-    """Load Stage-B model states for deterministic evaluation/generation."""
+    """Load synthetic-motion model states for deterministic evaluation/generation."""
     raw = torch.load(Path(checkpoint), map_location=device, weights_only=False)
     if not isinstance(raw, dict):
         raise ValueError("Stage-B checkpoint must contain a dictionary payload")

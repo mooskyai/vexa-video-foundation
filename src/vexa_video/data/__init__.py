@@ -1,4 +1,4 @@
-from .stage_b import StageBSyntheticDataset, stage_b_control
+from .controlled_motion import StageBSyntheticDataset, stage_b_control
 from .synthetic import (
     COLORS,
     DIRECTIONS,

@@ -25,7 +25,7 @@ The starter kit contains executable skeletons for:
 - a latent Video DiT with temporal/spatial patching;
 - a DDPM-style noise schedule;
 - training utilities and checkpoint format;
-- a CLI smoke test and M1 supervised motion-sanity probe;
+- a CLI smoke test and supervised motion-sanity probe;
 - CPU unit tests that validate shapes, determinism, gradients, and diffusion math;
 - architecture and scaling plans through the frontier-capability milestones.
 
@@ -36,11 +36,11 @@ The initial model is intentionally tiny. Its purpose is to prove the pipeline be
 ```text
 vexa-video-foundation/
 ├── src/vexa_video/
-│   ├── data/              # datasets and synthetic curriculum
+│   ├── data/              # datasets and controlled synthetic motion
 │   ├── diffusion/         # forward/reverse diffusion primitives
 │   ├── inference/         # samplers and generation entry points
 │   ├── models/            # tokenizer, text encoder, VAE, Video DiT
-│   ├── training/          # training/checkpoint utilities
+│   ├── training/          # trainer, evaluation, probe, checkpoints
 │   ├── utils/             # determinism and video utilities
 │   ├── cli.py
 │   └── config.py
@@ -94,203 +94,97 @@ Generate a deterministic synthetic training clip as a tensor checkpoint:
 uv run vexa-video synth --output outputs/sample.pt --frames 16 --size 64 --seed 42
 ```
 
-## M1 — Synthetic motion
+## Synthetic motion training
 
-M1 is still active. Stage A passed on the RTX 5050 development GPU; Stage B is the current generative experiment. M1 is **not complete** and M2 remains blocked until complete generated videos pass the frozen M1 quality gate.
+The current development baseline is one canonical synthetic-motion training path. Historical v2/v3/v4/v5 experiment labels are not part of the runtime architecture; their results are preserved in `docs/experiments/synthetic-motion.md`.
 
-### Stage A — passed
+The active curriculum is intentionally narrow: one object, four cardinal directions, four colors, square/circle, fixed medium linear speed, static camera, 8 frames at 32x32. Training uses the project-owned byte tokenizer, Transformer text encoder, TinyVideoVAE, VideoDiT, classifier-free-guided DDIM sampling, caption counterfactuals, decoded semantic losses, and balanced full-horizon direction/color preservation.
 
-The supervised sanity probe established that direction and color are recoverable from the deterministic renderer without lowering the gate:
+The accepted 64-sample, 50-step frozen evaluation is:
 
 ```text
-steps=300
-baseline_direction_accuracy=0.246094
-baseline_color_accuracy=0.250000
-direction_accuracy=0.984375
+direction_accuracy=0.828125
 color_accuracy=1.000000
+mean_motion=0.066824
+static_rate=0.000000
 gate_passed=True
 ```
 
-The probe is only evidence that the synthetic signal is learnable. It is not evidence that the generative model follows prompts.
-
-### Stage B — active
-
-The first Stage-B GPU run proved that the generator learned motion but did **not** pass
-controlled generation. With the original pooled-text conditioning path, the frozen random
-baseline and trained `best.pt` measured:
+The same-protocol random baseline is:
 
 ```text
-                         random       trained
-direction_accuracy      0.265625     0.312500
-color_accuracy          0.250000     0.265625
-mean_motion             0.009729     0.136491
-static_rate             1.000000     0.000000
+direction_accuracy=0.250000
+color_accuracy=0.250000
+mean_motion=0.012409
+static_rate=1.000000
+gate_passed=False
 ```
 
-The VAE was healthy (`vae_validation_reconstruction_loss=0.024338`) and motion/static collapse
-was solved, but direction and color remained near chance. Stage B therefore stays active and M2
-stays blocked.
+The frozen gate remains direction >= 0.75, color >= 0.75, static <= 0.10, and mean motion > 0.02. Requested labels are used only as evaluation ground truth; generated RGB pixels and temporal motion determine the measured result.
 
-Stage B connects the existing project-owned components into the first real generative training path:
+Run the supervised sanity probe:
 
-```text
-synthetic RGB video
-  -> TinyVideoVAE warmup + reconstruction safety gate
-  -> frozen latent representation
-  -> diffusion noise
-  -> ByteTokenizer + TransformerTextEncoder
-  -> token-level text attention + pooled text conditioning
-  -> VideoDiT with deterministic 3D Fourier patch positions
-  -> correct-vs-counterfactual caption objective + null-prompt objective
-  -> epsilon/noise prediction
-  -> deterministic reduced-step reverse diffusion with classifier-free guidance
-  -> TinyVideoVAE.decode
-  -> generated RGB video evaluation
+```powershell
+uv run vexa-video probe `
+  --config configs/tiny.toml `
+  --run-dir runs/probe `
+  --steps 300 `
+  --cuda
 ```
 
-The Stage-B curriculum is intentionally narrow: one object, four directions, four colors, square/circle, fixed medium linear speed, static camera, 8 frames at 32x32. Bounce, acceleration, rotation, camera movement, multiple objects and real video remain disabled.
-
-Before diffusion starts, the VAE is trained on reconstruction and must pass the configured foreground-aware reconstruction safety gate. This prevents a broken latent representation from silently contaminating diffusion training. The VAE safety threshold is not the M1 generative quality gate.
-
-The corrective conditioning path still uses only the project-owned caption path. Direction/color
-control labels are **not** injected into the model. During training, valid captions are compared
-against captions with only the color word or direction word changed; this forces the denoiser to
-be sensitive to the text it already receives. A null caption is trained in parallel so deterministic
-classifier-free guidance can strengthen prompt adherence at sampling time. Half of corrective
-training timesteps are drawn from the high-noise half of the diffusion schedule, where the caption
-carries more information than the corrupted latent. The token-attention path adds no new
-parameters, so the first Stage-B `best.pt` remains weight/optimizer compatible.
-
-The completed Stage-B-v2 GPU evaluation improved color control substantially but still failed the
-frozen gate: direction `0.265625`, color `0.703125`, mean motion `0.163834`, static rate `0.000000`.
-The direction result remained at chance even though color nearly reached its gate. Stage-B-v3 therefore
-adds a decoded semantic auxiliary at a fixed noisy timestep. It reconstructs the model's predicted clean
-latent through the frozen VAE and penalizes motion whose soft centroid disagrees with the caption
-direction. The same noisy latent is also evaluated with a one-word direction counterfactual, so the model
-must change the generated motion when only `left/right/up/down` changes. A smaller decoded color loss
-is retained to push color across its existing `0.75` gate. Captions remain the only model conditioning
-input; semantic targets are training losses only and are never injected into the denoiser.
-
-Stage-B-v3 resumes the v2 `best.pt` without changing model parameters or optimizer structure. Only the
-validation selector resets because the score now includes held-out decoded direction/color semantic
-losses. The corrective target is extended to 8000 diffusion steps.
-
-The completed Stage-B-v3 generated-video evaluation passed color (`0.781250`), mean-motion
-(`0.139715`) and static-rate (`0.000000`) gates, but direction remained at chance (`0.250000`).
-Stage-B-v4 therefore adds sampler-aligned direction supervision: a small training sub-batch starts
-from Gaussian latent noise, runs the same classifier-free-guided DDIM implementation used by
-inference for a short differentiable rollout, decodes the result, and applies the existing soft
-cardinal-motion loss. All four direction captions share the same starting noise, so the caption must
-cause the motion difference. This is a training-only correction; the frozen 50-step evaluation path,
-guidance scale and M1 thresholds do not change. The v4 target is 10000 diffusion steps.
-
-Stage-B-v4 proved that direction control is horizon-specific rather than absent. Its frozen 50-step
-result was direction `0.156250`, color `0.781250`, mean motion `0.131964`, static rate `0.015625`.
-A validation-only horizon sweep then measured direction `1.000000` at 4 and 6 steps, `0.953125` at
-8, `0.421875` at 12, and near chance from 16 through 50 steps. The first Stage-B-v5 correction added
-a periodic differentiable 50-step direction loss and solved direction completely, but its frozen
-50-step test result regressed color/static behavior: direction `1.000000`, color `0.343750`, mean
-motion `0.044545`, static rate `0.156250`. This remains a Stage-B-v5 regression correction rather
-than a new milestone.
-
-The balanced v5 correction restarts from the v4 `best.pt`, where color/static already passed. The
-same 50-step four-direction rollout now supervises both cardinal motion and the original caption color,
-so no additional expensive rollout is required. The full-horizon direction term is reduced to avoid
-dominating the clipped gradient, and the long-horizon minimum displacement is raised to protect the
-static-rate gate. Validation checkpoint selection uses normalized deficits against all four frozen gates
-so a solved direction score cannot hide a color/static regression.
-
-Run the balanced v5 correction in a fresh directory:
+Train the canonical synthetic-motion generator:
 
 ```powershell
 uv run vexa-video train `
   --config configs/tiny.toml `
-  --run-dir runs/m1-stage-b-v5-balanced `
-  --resume runs/m1-stage-b-v4/checkpoints/best.pt `
+  --run-dir runs/synthetic-motion `
   --cuda
 ```
 
-The target remains 13000 diffusion steps. Every fourth optimization step uses the balanced 50-step
-preservation objective; every checkpoint interval runs the fixed 16-sample validation-split 50-step
-selector. The frozen 64-sample test protocol and all absolute M1 thresholds remain unchanged.
-
-Because the corrective path changes the generation protocol (token attention + guidance), record
-a fresh random baseline before corrective training. The absolute M1 thresholds do not change:
+Evaluate a checkpoint with the frozen protocol:
 
 ```powershell
-uv run vexa-video evaluate-m1 `
+uv run vexa-video evaluate `
+  --config configs/tiny.toml `
+  --checkpoint runs/synthetic-motion/checkpoints/best.pt `
+  --samples 64 `
+  --sampling-steps 50 `
+  --output runs/synthetic-motion/generated-metrics.json `
+  --cuda
+```
+
+Evaluate the same-protocol random baseline:
+
+```powershell
+uv run vexa-video evaluate `
   --config configs/tiny.toml `
   --random-baseline `
   --samples 64 `
   --sampling-steps 50 `
-  --output runs/m1-stage-b-v2/random-baseline.json `
+  --output runs/synthetic-motion/random-baseline.json `
   --cuda
 ```
 
-Resume the successful VAE/denoiser state from the original Stage-B `best.pt` into a separate run
-directory. The old checkpoint resumes at its recorded diffusion step, while the best-checkpoint
-selector is reset because validation now includes prompt-sensitivity gaps:
-
-```powershell
-uv run vexa-video train `
-  --config configs/tiny.toml `
-  --run-dir runs/m1-stage-b-v2 `
-  --resume runs/m1-stage-b/checkpoints/best.pt `
-  --cuda
-```
-
-Checkpoint resume normalizes saved CUDA RNG byte tensors back to CPU before handing them to PyTorch's CUDA RNG API. This keeps the original Stage-B CUDA checkpoints compatible with corrective training while preserving model, optimizer, RNG, and diffusion-step state.
-
-Resume without resetting model/optimizer/RNG/training progress:
-
-```powershell
-uv run vexa-video train `
-  --config configs/tiny.toml `
-  --run-dir runs/m1-stage-b-v2 `
-  --resume runs/m1-stage-b-v2/checkpoints/latest.pt `
-  --cuda
-```
-
-`latest.pt` is the most recent resumable checkpoint. `best.pt` minimizes held-out reconstruction,
-conditional diffusion loss and a penalty when color/direction counterfactual captions are not worse
-than the correct caption by the configured margin. Final M1 completion is still decided by complete
-generated-video metrics, not by this validation score.
-
-Evaluate the trained generator:
-
-```powershell
-uv run vexa-video evaluate-m1 `
-  --config configs/tiny.toml `
-  --checkpoint runs/m1-stage-b-v2/checkpoints/best.pt `
-  --samples 64 `
-  --sampling-steps 50 `
-  --output runs/m1-stage-b-v2/generated-metrics.json `
-  --cuda
-```
-
-The evaluator derives direction from generated temporal motion and color from generated RGB pixels.
-It reports direction accuracy, color accuracy, mean motion, static rate, confusion matrices, the
-guidance scale and `gate_passed`. The frozen gate is direction >= 0.75, color >= 0.75, static <=
-0.10 and mean motion > 0.02. Requested labels are used only as ground truth for comparison.
-
-Generate a sample after training:
+Generate a sample:
 
 ```powershell
 uv run vexa-video generate `
   --config configs/tiny.toml `
-  --checkpoint runs/m1-stage-b-v2/checkpoints/best.pt `
+  --checkpoint runs/synthetic-motion/checkpoints/best.pt `
   --prompt "a red square moves right at medium speed" `
   --output outputs/red-right.mp4 `
   --seed 42 `
   --cuda
 ```
 
+The accepted pre-consolidation checkpoint remains compatible with this code. Re-run the frozen evaluation after applying the consolidation patch before unlocking the next research milestone.
+
 ## Development checks
 
 ```powershell
 uv run ruff check .
 uv run ruff format --check .
-uv run mypy src
+uv run mypy src tests
 uv run pytest --cov=vexa_video
 ```
 
