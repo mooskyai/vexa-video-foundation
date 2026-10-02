@@ -89,23 +89,31 @@ class M1Config:
     semantic_timestep: int = 500
     semantic_direction_weight: float = 2.0
     semantic_color_weight: float = 0.5
+    semantic_shape_weight: float = 1.0
     semantic_min_motion: float = 0.10
     rollout_steps: int = 4
     rollout_batch_size: int = 1
     rollout_direction_weight: float = 1.0
+    rollout_shape_weight: float = 1.0
     full_rollout_steps: int = 50
     full_rollout_every: int = 4
     full_rollout_direction_weight: float = 0.25
     full_rollout_color_weight: float = 1.0
+    full_rollout_shape_weight: float = 1.0
     full_rollout_min_motion: float = 0.35
-    validation_generation_samples: int = 16
+    validation_generation_samples: int = 32
     validation_generation_direction_weight: float = 1.0
     validation_generation_other_weight: float = 1.0
     guidance_scale: float = 3.0
     generation_direction_gate: float = 0.75
     generation_color_gate: float = 0.75
+    generation_shape_gate: float = 0.75
     generation_static_rate_gate: float = 0.10
     generation_mean_motion_gate: float = 0.02
+    generation_object_like_frame_gate: float = 0.90
+    generation_persistent_video_gate: float = 0.90
+    generation_foreground_area_ratio_min: float = 0.75
+    generation_foreground_area_ratio_max: float = 1.50
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,7 +235,11 @@ def validate_config(cfg: ProjectConfig) -> None:
         raise ValueError("m1.high_noise_conditioning_fraction must be in [0, 1]")
     if not 0 <= cfg.m1.semantic_timestep < cfg.diffusion.timesteps:
         raise ValueError("m1.semantic_timestep must be in [0, diffusion.timesteps)")
-    if cfg.m1.semantic_direction_weight < 0 or cfg.m1.semantic_color_weight < 0:
+    if (
+        cfg.m1.semantic_direction_weight < 0
+        or cfg.m1.semantic_color_weight < 0
+        or cfg.m1.semantic_shape_weight < 0
+    ):
         raise ValueError("m1 semantic loss weights must be non-negative")
     if cfg.m1.semantic_min_motion <= 0:
         raise ValueError("m1.semantic_min_motion must be positive")
@@ -235,14 +247,14 @@ def validate_config(cfg: ProjectConfig) -> None:
         raise ValueError("m1.rollout_steps must be in [1, diffusion.timesteps]")
     if cfg.m1.rollout_batch_size <= 0:
         raise ValueError("m1.rollout_batch_size must be positive")
-    if cfg.m1.rollout_direction_weight < 0:
-        raise ValueError("m1.rollout_direction_weight must be non-negative")
+    if cfg.m1.rollout_direction_weight < 0 or cfg.m1.rollout_shape_weight < 0:
+        raise ValueError("m1 rollout weights must be non-negative")
     if not cfg.m1.rollout_steps <= cfg.m1.full_rollout_steps <= cfg.m1.sampling_steps:
         raise ValueError("m1.full_rollout_steps must be in [m1.rollout_steps, m1.sampling_steps]")
     if cfg.m1.full_rollout_every <= 0:
         raise ValueError("m1.full_rollout_every must be positive")
-    if cfg.m1.full_rollout_direction_weight < 0:
-        raise ValueError("m1.full_rollout_direction_weight must be non-negative")
+    if cfg.m1.full_rollout_direction_weight < 0 or cfg.m1.full_rollout_shape_weight < 0:
+        raise ValueError("m1 full-rollout direction/shape weights must be non-negative")
     if (
         cfg.m1.validation_generation_samples <= 0
         or cfg.m1.validation_generation_samples % 16 != 0
@@ -267,7 +279,17 @@ def validate_config(cfg: ProjectConfig) -> None:
         raise ValueError("m1.generation_direction_gate must be in (0, 1]")
     if not 0.0 < cfg.m1.generation_color_gate <= 1.0:
         raise ValueError("m1.generation_color_gate must be in (0, 1]")
+    if not 0.0 < cfg.m1.generation_shape_gate <= 1.0:
+        raise ValueError("m1.generation_shape_gate must be in (0, 1]")
     if not 0.0 <= cfg.m1.generation_static_rate_gate <= 1.0:
         raise ValueError("m1.generation_static_rate_gate must be in [0, 1]")
     if cfg.m1.generation_mean_motion_gate <= 0:
         raise ValueError("m1.generation_mean_motion_gate must be positive")
+    if not 0.0 < cfg.m1.generation_object_like_frame_gate <= 1.0:
+        raise ValueError("m1.generation_object_like_frame_gate must be in (0, 1]")
+    if not 0.0 < cfg.m1.generation_persistent_video_gate <= 1.0:
+        raise ValueError("m1.generation_persistent_video_gate must be in (0, 1]")
+    if cfg.m1.generation_foreground_area_ratio_min <= 0:
+        raise ValueError("m1.generation_foreground_area_ratio_min must be positive")
+    if cfg.m1.generation_foreground_area_ratio_max <= cfg.m1.generation_foreground_area_ratio_min:
+        raise ValueError("m1.generation_foreground_area_ratio_max must exceed the minimum")

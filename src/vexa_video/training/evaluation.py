@@ -53,8 +53,14 @@ def passes_m1_generation_gate(metrics: M1GenerationMetrics, cfg: ProjectConfig) 
     return (
         metrics.direction_accuracy >= cfg.m1.generation_direction_gate
         and metrics.color_accuracy >= cfg.m1.generation_color_gate
+        and metrics.shape_accuracy >= cfg.m1.generation_shape_gate
         and metrics.static_rate <= cfg.m1.generation_static_rate_gate
         and metrics.mean_motion > cfg.m1.generation_mean_motion_gate
+        and metrics.object_like_frame_rate >= cfg.m1.generation_object_like_frame_gate
+        and metrics.persistent_video_rate >= cfg.m1.generation_persistent_video_gate
+        and cfg.m1.generation_foreground_area_ratio_min
+        <= metrics.mean_foreground_area_ratio
+        <= cfg.m1.generation_foreground_area_ratio_max
     )
 
 

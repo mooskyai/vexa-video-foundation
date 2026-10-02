@@ -98,9 +98,9 @@ uv run vexa-video synth --output outputs/sample.pt --frames 16 --size 64 --seed 
 
 The current development baseline is one canonical synthetic-motion training path. Historical v2/v3/v4/v5 experiment labels are not part of the runtime architecture; their results are preserved in `docs/experiments/synthetic-motion.md`.
 
-The active curriculum is intentionally narrow: one object, four cardinal directions, four colors, square/circle, fixed medium linear speed, static camera, 8 frames at 32x32. Training uses the project-owned byte tokenizer, Transformer text encoder, TinyVideoVAE, VideoDiT, classifier-free-guided DDIM sampling, caption counterfactuals, decoded semantic losses, and balanced full-horizon direction/color preservation.
+The active curriculum is intentionally narrow: one object, four cardinal directions, four colors, square/circle, fixed medium linear speed, static camera, 8 frames at 32x32. Training uses the project-owned byte tokenizer, Transformer text encoder, TinyVideoVAE, VideoDiT, classifier-free-guided DDIM sampling, caption counterfactuals, decoded semantic losses, and balanced full-horizon direction/color/shape preservation.
 
-The accepted 64-sample, 50-step frozen evaluation is:
+The historical 64-sample, 50-step control-only evaluation that triggered the later visual-fidelity review was:
 
 ```text
 direction_accuracy=0.828125
@@ -164,7 +164,7 @@ static_rate=1.000000
 gate_passed=False
 ```
 
-The frozen gate remains direction >= 0.75, color >= 0.75, static <= 0.10, and mean motion > 0.02. Requested labels are used only as evaluation ground truth; generated RGB pixels and temporal motion determine the measured result.
+The final generated-video gate keeps the original thresholds and adds the visual-fidelity requirements before corrected diffusion training: direction >= 0.75, color >= 0.75, shape >= 0.75, static <= 0.10, mean motion > 0.02, object-like frame rate >= 0.90, persistent-video rate >= 0.90, and mean foreground-area ratio in `[0.75, 1.50]`. Requested labels are ground truth only; generated RGB pixels and temporal motion determine every measured result.
 
 Run the supervised sanity probe:
 
@@ -176,14 +176,17 @@ uv run vexa-video probe `
   --cuda
 ```
 
-Train the canonical synthetic-motion generator:
+Train the corrected synthetic-motion generator from the independently passing VAE checkpoint. Shape is supervised through caption counterfactuals, decoded differentiable shape loss, and the same full-horizon rollout already used for motion/color; no structured shape control is injected into the denoiser:
 
 ```powershell
 uv run vexa-video train `
   --config configs/tiny.toml `
-  --run-dir runs/synthetic-motion `
+  --run-dir runs/synthetic-motion-shape-control `
+  --resume runs/synthetic-motion-shape-footprint/checkpoints/latest.pt `
   --cuda
 ```
+
+Checkpoint selection now includes generated direction, color, shape, motion, static rate, object persistence, and renderer-relative foreground area at the full 50-step horizon, so a direction/color-only checkpoint cannot become canonical.
 
 Evaluate a checkpoint with the frozen protocol:
 
@@ -224,6 +227,8 @@ uv run vexa-video generate `
 The earlier 4x-spatial synthetic-motion checkpoint is no longer compatible after the shape-recovery
 latent-contract correction. Preserve it as experiment evidence; train a clean 2x-spatial candidate
 and pass the VAE gate before starting corrected diffusion training. M2 remains blocked.
+
+The first shape-aware diffusion run exposed an objective mismatch: generated direction/color converged, but shape stayed near chance while persistence collapsed and foreground area expanded to roughly four times the renderer target. The correction keeps caption-only shape conditioning and adds differentiable per-frame foreground-area supervision to decoded semantic predictions and short/full CFG-DDIM rollout shape losses. Start this corrected diffusion objective from the independently passing VAE-only checkpoint at `diffusion_step=0`; do not resume the failed shape-control diffusion checkpoints.
 
 ## Development checks
 

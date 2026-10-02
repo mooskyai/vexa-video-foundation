@@ -18,6 +18,7 @@ from vexa_video.training.evaluation import (
 )
 from vexa_video.training.trainer import (
     _normalize_cuda_rng_states,
+    _soft_shape_score,
     _soft_video_features,
     _validation_generation_metrics,
     build_stage_b_components,
@@ -106,6 +107,22 @@ def test_soft_video_features_recover_cardinal_direction_and_color() -> None:
     assert color.shape == (4, 3)
 
 
+def test_soft_shape_score_separates_square_and_circle() -> None:
+    dataset = StageBSyntheticDataset(
+        length=32,
+        frames=8,
+        size=32,
+        base_seed=42,
+        split="train",
+    )
+    square = dataset.sample(0).video
+    circle = dataset.sample(16).video
+    scores = _soft_shape_score(torch.stack((square, circle)))
+    assert scores[0] > scores[1]
+    assert float(scores[0].item()) > 0.9
+    assert float(scores[1].item()) < 0.8
+
+
 def test_reconstruction_loss_penalizes_diffuse_foreground() -> None:
     sample = StageBSyntheticDataset(
         length=1,
@@ -152,8 +169,10 @@ def test_diffusion_train_step_is_finite_and_reaches_text_and_dit() -> None:
     assert torch.isfinite(torch.tensor(metrics.prompt_contrast_loss))
     assert torch.isfinite(torch.tensor(metrics.color_prompt_gap))
     assert torch.isfinite(torch.tensor(metrics.direction_prompt_gap))
+    assert torch.isfinite(torch.tensor(metrics.shape_prompt_gap))
     assert torch.isfinite(torch.tensor(metrics.semantic_direction_loss))
     assert torch.isfinite(torch.tensor(metrics.semantic_color_loss))
+    assert torch.isfinite(torch.tensor(metrics.semantic_shape_loss))
     assert any(parameter.grad is not None for parameter in components.text_encoder.parameters())
     assert any(parameter.grad is not None for parameter in components.dit.parameters())
 
@@ -185,8 +204,10 @@ def test_full_horizon_rollout_loss_is_finite_and_reaches_trainable_path() -> Non
     )
     assert torch.isfinite(torch.tensor(metrics.full_rollout_direction_loss))
     assert torch.isfinite(torch.tensor(metrics.full_rollout_color_loss))
+    assert torch.isfinite(torch.tensor(metrics.full_rollout_shape_loss))
     assert metrics.full_rollout_direction_loss >= 0.0
     assert metrics.full_rollout_color_loss >= 0.0
+    assert metrics.full_rollout_shape_loss >= 0.0
     assert any(parameter.grad is not None for parameter in components.text_encoder.parameters())
     assert any(parameter.grad is not None for parameter in components.dit.parameters())
 
@@ -194,15 +215,21 @@ def test_full_horizon_rollout_loss_is_finite_and_reaches_trainable_path() -> Non
 def test_validation_generation_metrics_use_full_horizon() -> None:
     cfg = _tiny_test_config()
     components = build_stage_b_components(cfg, device=torch.device("cpu"))
-    direction, color, motion, static = _validation_generation_metrics(
-        components=components,
-        cfg=cfg,
-        device=torch.device("cpu"),
+    direction, color, shape, motion, static, object_like, persistent, area_ratio = (
+        _validation_generation_metrics(
+            components=components,
+            cfg=cfg,
+            device=torch.device("cpu"),
+        )
     )
     assert 0.0 <= direction <= 1.0
     assert 0.0 <= color <= 1.0
+    assert 0.0 <= shape <= 1.0
     assert motion >= 0.0
     assert 0.0 <= static <= 1.0
+    assert 0.0 <= object_like <= 1.0
+    assert 0.0 <= persistent <= 1.0
+    assert area_ratio >= 0.0
 
 
 def test_sampler_shape_and_fixed_seed_determinism() -> None:
@@ -318,7 +345,10 @@ def test_generated_metrics_identify_cardinal_synthetic_videos() -> None:
     assert metrics.persistent_video_rate == 1.0
     assert metrics.mean_foreground_area_ratio == 1.0
     assert metrics.shape_confusion == [[16, 0], [0, 16]]
-    assert passes_m1_generation_gate(metrics, _tiny_test_config())
+    cfg = _tiny_test_config()
+    assert passes_m1_generation_gate(metrics, cfg)
+    assert not passes_m1_generation_gate(replace(metrics, shape_accuracy=0.0), cfg)
+    assert not passes_m1_generation_gate(replace(metrics, persistent_video_rate=0.0), cfg)
 
 
 def test_visual_fidelity_diagnostics_reject_diffuse_foreground() -> None:

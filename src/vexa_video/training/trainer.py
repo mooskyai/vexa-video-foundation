@@ -12,7 +12,8 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from vexa_video.config import ProjectConfig
-from vexa_video.data import COLORS, DIRECTIONS, StageBSyntheticDataset, SyntheticControl
+from vexa_video.data import COLORS, DIRECTIONS, SHAPES, StageBSyntheticDataset, SyntheticControl
+from vexa_video.data.controlled_motion import controlled_motion_shape_size
 from vexa_video.diffusion import LinearNoiseSchedule
 from vexa_video.inference.sampler import guided_ddim_rollout, sample_video
 from vexa_video.models import ByteTokenizer, TinyVideoVAE, TransformerTextEncoder, VideoDiT
@@ -39,10 +40,13 @@ class StageBStepMetrics:
     prompt_contrast_loss: float = 0.0
     color_prompt_gap: float = 0.0
     direction_prompt_gap: float = 0.0
+    shape_prompt_gap: float = 0.0
     semantic_direction_loss: float = 0.0
     semantic_color_loss: float = 0.0
+    semantic_shape_loss: float = 0.0
     full_rollout_direction_loss: float = 0.0
     full_rollout_color_loss: float = 0.0
+    full_rollout_shape_loss: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,22 +197,29 @@ def _conditioning_predictions(
     captions: list[str],
     cfg: ProjectConfig,
     device: torch.device,
-) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
     color_counterfactuals = [_counterfactual_caption(caption, COLORS) for caption in captions]
     direction_counterfactuals = [
         _counterfactual_caption(caption, DIRECTIONS) for caption in captions
     ]
+    shape_counterfactuals = [_counterfactual_caption(caption, SHAPES) for caption in captions]
     unconditional = [""] * len(captions)
-    all_captions = [*captions, *color_counterfactuals, *direction_counterfactuals, *unconditional]
+    all_captions = [
+        *captions,
+        *color_counterfactuals,
+        *direction_counterfactuals,
+        *shape_counterfactuals,
+        *unconditional,
+    ]
     tokens = components.tokenizer.batch(all_captions, cfg.text.max_length, device=device)
     text_tokens = components.text_encoder(tokens.input_ids, tokens.attention_mask)
     predicted = components.dit(
-        torch.cat((noisy_latents, noisy_latents, noisy_latents, noisy_latents), dim=0),
-        timesteps.repeat(4),
+        torch.cat((noisy_latents,) * 5, dim=0),
+        timesteps.repeat(5),
         text_tokens,
         tokens.attention_mask,
     )
-    return cast(tuple[Tensor, Tensor, Tensor, Tensor], predicted.chunk(4, dim=0))
+    return cast(tuple[Tensor, Tensor, Tensor, Tensor, Tensor], predicted.chunk(5, dim=0))
 
 
 def _per_sample_mse(prediction: Tensor, target: Tensor) -> Tensor:
@@ -264,6 +275,125 @@ def _soft_video_features(video: Tensor) -> tuple[Tensor, Tensor]:
     return motion, mean_color
 
 
+def _soft_shape_score(video: Tensor) -> Tensor:
+    """Differentiable corner-occupancy score: square ~= 1, circle < 1."""
+    if video.ndim != 5 or video.shape[1] != 3:
+        raise ValueError("video must have shape [B, 3, T, H, W]")
+    weights = ((video + 1.0) * 0.5).clamp(0.0, 1.0).amax(dim=1).square()
+    _, _, height, width = weights.shape
+    x = torch.linspace(-1.0, 1.0, width, device=video.device, dtype=video.dtype)
+    y = torch.linspace(-1.0, 1.0, height, device=video.device, dtype=video.dtype)
+    y_grid, x_grid = torch.meshgrid(y, x, indexing="ij")
+    mass = weights.sum(dim=(2, 3)).clamp_min(1e-6)
+    center_x = (weights * x_grid.view(1, 1, height, width)).sum(dim=(2, 3)) / mass
+    center_y = (weights * y_grid.view(1, 1, height, width)).sum(dim=(2, 3)) / mass
+    dx = x_grid.view(1, 1, height, width) - center_x[:, :, None, None]
+    dy = y_grid.view(1, 1, height, width) - center_y[:, :, None, None]
+    variance_x = (weights * dx.square()).sum(dim=(2, 3)) / mass
+    variance_y = (weights * dy.square()).sum(dim=(2, 3)) / mass
+    corner_moment = (weights * dx.square() * dy.square()).sum(dim=(2, 3)) / mass
+    score = corner_moment / (variance_x * variance_y).clamp_min(1e-6)
+    return score.mean(dim=1)
+
+
+def _shape_template_target(
+    shape: str,
+    size: int,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Tensor:
+    shape_size = controlled_motion_shape_size(size)
+    coords = torch.arange(shape_size, device=device, dtype=dtype)
+    yy, xx = torch.meshgrid(coords, coords, indexing="ij")
+    if shape == "square":
+        mask = torch.ones((shape_size, shape_size), device=device, dtype=dtype)
+    elif shape == "circle":
+        center = (shape_size - 1) / 2.0
+        radius = max(1.0, shape_size / 2.0)
+        mask = (((xx - center).square() + (yy - center).square()) <= radius**2).to(dtype)
+    else:
+        raise ValueError(f"unknown shape: {shape}")
+    weights = mask
+    mass = weights.sum().clamp_min(1e-6)
+    x = torch.linspace(-1.0, 1.0, shape_size, device=device, dtype=dtype)
+    y = torch.linspace(-1.0, 1.0, shape_size, device=device, dtype=dtype)
+    y_grid, x_grid = torch.meshgrid(y, x, indexing="ij")
+    center_x = (weights * x_grid).sum() / mass
+    center_y = (weights * y_grid).sum() / mass
+    dx = x_grid - center_x
+    dy = y_grid - center_y
+    variance_x = (weights * dx.square()).sum() / mass
+    variance_y = (weights * dy.square()).sum() / mass
+    corner_moment = (weights * dx.square() * dy.square()).sum() / mass
+    return corner_moment / (variance_x * variance_y).clamp_min(1e-6)
+
+
+def _shape_target(
+    caption: str,
+    size: int,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Tensor:
+    for shape in SHAPES:
+        if f" {shape} " in caption:
+            return _shape_template_target(shape, size, device=device, dtype=dtype)
+    raise ValueError(f"caption does not contain a shape term: {caption}")
+
+
+def _expected_foreground_area(
+    caption: str,
+    size: int,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Tensor:
+    shape_size = controlled_motion_shape_size(size)
+    for shape in SHAPES:
+        if f" {shape} " not in caption:
+            continue
+        if shape == "square":
+            area = float(shape_size * shape_size)
+        else:
+            coords = torch.arange(shape_size, device=device, dtype=dtype)
+            yy, xx = torch.meshgrid(coords, coords, indexing="ij")
+            center = (shape_size - 1) / 2.0
+            radius = max(1.0, shape_size / 2.0)
+            area = float(
+                (((xx - center).square() + (yy - center).square()) <= radius**2).sum().item()
+            )
+        return torch.tensor(area, device=device, dtype=dtype)
+    raise ValueError(f"caption does not contain a shape term: {caption}")
+
+
+def _soft_foreground_area_loss(video: Tensor, captions: list[str], size: int) -> Tensor:
+    """Penalize foreground expansion and disappearance on every generated frame."""
+    if video.ndim != 5 or video.shape[1] != 3:
+        raise ValueError("video must have shape [B, 3, T, H, W]")
+    if video.shape[0] != len(captions):
+        raise ValueError("video/caption counts must match")
+    signal = ((video + 1.0) * 0.5).clamp(0.0, 1.0).amax(dim=1)
+    soft_area = signal.sum(dim=(2, 3)).clamp_min(1e-4)
+    expected_area = torch.stack(
+        [
+            _expected_foreground_area(
+                caption,
+                size,
+                device=video.device,
+                dtype=video.dtype,
+            )
+            for caption in captions
+        ]
+    ).unsqueeze(1)
+    log_area_ratio = torch.log(soft_area / expected_area)
+    return 0.25 * F.smooth_l1_loss(
+        log_area_ratio,
+        torch.zeros_like(log_area_ratio),
+        beta=0.5,
+    )
+
+
 def _motion_target_loss(motion: Tensor, target: Tensor, minimum_motion: float) -> Tensor:
     alignment = 1.0 - F.cosine_similarity(motion, target, dim=-1, eps=1e-6)
     magnitude = motion.norm(dim=-1)
@@ -280,11 +410,11 @@ def _sampler_aligned_losses(
     initial_noise: Tensor,
     sampling_steps: int | None = None,
     minimum_motion: float | None = None,
-) -> tuple[Tensor, Tensor]:
+) -> tuple[Tensor, Tensor, Tensor]:
     batch = min(cfg.m1.rollout_batch_size, clean_latents.shape[0], len(captions))
     if batch <= 0:
         zero = clean_latents.new_zeros(())
-        return zero, zero
+        return zero, zero, zero
 
     base_captions = captions[:batch]
     rollout_captions = [
@@ -328,6 +458,7 @@ def _sampler_aligned_losses(
     )
     rollout_video = components.vae.decode(rollout_latents)
     rollout_motion, rollout_color = _soft_video_features(rollout_video)
+    rollout_shape = _soft_shape_score(rollout_video)
     direction_targets = torch.tensor(
         [_DIRECTION_TARGETS[direction] for _ in base_captions for direction in DIRECTIONS],
         device=device,
@@ -340,6 +471,18 @@ def _sampler_aligned_losses(
             for _ in DIRECTIONS
         ]
     )
+    shape_targets = torch.stack(
+        [
+            _shape_target(
+                caption,
+                cfg.data.height,
+                device=device,
+                dtype=rollout_video.dtype,
+            )
+            for caption in base_captions
+            for _ in DIRECTIONS
+        ]
+    )
     motion_floor = cfg.m1.semantic_min_motion if minimum_motion is None else minimum_motion
     direction_loss = _motion_target_loss(
         rollout_motion,
@@ -347,7 +490,13 @@ def _sampler_aligned_losses(
         motion_floor,
     )
     color_loss = F.mse_loss(rollout_color, color_targets)
-    return direction_loss, color_loss
+    shape_loss = F.mse_loss(rollout_shape, shape_targets)
+    shape_loss = shape_loss + _soft_foreground_area_loss(
+        rollout_video,
+        rollout_captions,
+        cfg.data.height,
+    )
+    return direction_loss, color_loss, shape_loss
 
 
 def _semantic_conditioning_losses(
@@ -358,14 +507,20 @@ def _semantic_conditioning_losses(
     cfg: ProjectConfig,
     device: torch.device,
     noise: Tensor | None = None,
-) -> tuple[Tensor, Tensor]:
+) -> tuple[Tensor, Tensor, Tensor]:
     batch = clean_latents.shape[0]
     semantic_timesteps = torch.full(
         (batch,), cfg.m1.semantic_timestep, device=device, dtype=torch.long
     )
     semantic_noise = torch.randn_like(clean_latents) if noise is None else noise
     noisy = components.schedule.add_noise(clean_latents, semantic_noise, semantic_timesteps)
-    conditioned, color_counterfactual, direction_counterfactual, _ = _conditioning_predictions(
+    (
+        conditioned,
+        color_counterfactual,
+        direction_counterfactual,
+        shape_counterfactual,
+        _,
+    ) = _conditioning_predictions(
         components=components,
         noisy_latents=noisy,
         timesteps=semantic_timesteps,
@@ -375,6 +530,7 @@ def _semantic_conditioning_losses(
     )
     color_captions = [_counterfactual_caption(caption, COLORS) for caption in captions]
     direction_captions = [_counterfactual_caption(caption, DIRECTIONS) for caption in captions]
+    shape_captions = [_counterfactual_caption(caption, SHAPES) for caption in captions]
     predicted_clean = torch.cat(
         [
             components.schedule.predict_clean(noisy, conditioned, cfg.m1.semantic_timestep),
@@ -384,14 +540,19 @@ def _semantic_conditioning_losses(
             components.schedule.predict_clean(
                 noisy, direction_counterfactual, cfg.m1.semantic_timestep
             ),
+            components.schedule.predict_clean(
+                noisy, shape_counterfactual, cfg.m1.semantic_timestep
+            ),
         ],
         dim=0,
     )
     decoded = components.vae.decode(predicted_clean)
-    correct_video, color_video, direction_video = decoded.chunk(3, dim=0)
+    correct_video, color_video, direction_video, shape_video = decoded.chunk(4, dim=0)
     correct_motion, correct_color = _soft_video_features(correct_video)
+    correct_shape = _soft_shape_score(correct_video)
     _, counterfactual_color = _soft_video_features(color_video)
     counterfactual_motion, _ = _soft_video_features(direction_video)
+    counterfactual_shape = _soft_shape_score(shape_video)
 
     direction_target = torch.stack(
         [
@@ -417,6 +578,18 @@ def _semantic_conditioning_losses(
             for caption in color_captions
         ]
     )
+    shape_target = torch.stack(
+        [
+            _shape_target(caption, cfg.data.height, device=device, dtype=clean_latents.dtype)
+            for caption in captions
+        ]
+    )
+    shape_counterfactual_target = torch.stack(
+        [
+            _shape_target(caption, cfg.data.height, device=device, dtype=clean_latents.dtype)
+            for caption in shape_captions
+        ]
+    )
     direction_loss = 0.5 * (
         _motion_target_loss(correct_motion, direction_target, cfg.m1.semantic_min_motion)
         + _motion_target_loss(
@@ -427,7 +600,15 @@ def _semantic_conditioning_losses(
         F.mse_loss(correct_color, color_target)
         + F.mse_loss(counterfactual_color, color_counterfactual_target)
     )
-    rollout_direction_loss, _ = _sampler_aligned_losses(
+    shape_loss = 0.5 * (
+        F.mse_loss(correct_shape, shape_target)
+        + F.mse_loss(counterfactual_shape, shape_counterfactual_target)
+    )
+    shape_loss = shape_loss + 0.5 * (
+        _soft_foreground_area_loss(correct_video, captions, cfg.data.height)
+        + _soft_foreground_area_loss(shape_video, shape_captions, cfg.data.height)
+    )
+    rollout_direction_loss, _, rollout_shape_loss = _sampler_aligned_losses(
         components=components,
         clean_latents=clean_latents,
         captions=captions,
@@ -436,7 +617,8 @@ def _semantic_conditioning_losses(
         initial_noise=semantic_noise,
     )
     direction_loss = direction_loss + cfg.m1.rollout_direction_weight * rollout_direction_loss
-    return direction_loss, color_loss
+    shape_loss = shape_loss + cfg.m1.rollout_shape_weight * rollout_shape_loss
+    return direction_loss, color_loss, shape_loss
 
 
 def vae_warmup_step(
@@ -497,42 +679,58 @@ def diffusion_train_step(
     )
     noise = torch.randn_like(latents)
     noisy_latents = components.schedule.add_noise(latents, noise, timesteps)
-    conditioned, color_counterfactual, direction_counterfactual, unconditional = (
-        _conditioning_predictions(
+    (
+        conditioned,
+        color_counterfactual,
+        direction_counterfactual,
+        shape_counterfactual,
+        unconditional,
+    ) = _conditioning_predictions(
+        components=components,
+        noisy_latents=noisy_latents,
+        timesteps=timesteps,
+        captions=captions,
+        cfg=cfg,
+        device=device,
+    )
+    conditioned_error = _per_sample_mse(conditioned, noise)
+    color_counterfactual_error = _per_sample_mse(color_counterfactual, noise)
+    direction_counterfactual_error = _per_sample_mse(direction_counterfactual, noise)
+    shape_counterfactual_error = _per_sample_mse(shape_counterfactual, noise)
+    unconditional_error = _per_sample_mse(unconditional, noise)
+    color_gap = color_counterfactual_error - conditioned_error
+    direction_gap = direction_counterfactual_error - conditioned_error
+    shape_gap = shape_counterfactual_error - conditioned_error
+    contrast_loss = (
+        F.relu(cfg.m1.prompt_contrast_margin - color_gap).mean()
+        + F.relu(cfg.m1.prompt_contrast_margin - direction_gap).mean()
+        + F.relu(cfg.m1.prompt_contrast_margin - shape_gap).mean()
+    ) / 3.0
+    diffusion_loss = conditioned_error.mean()
+    unconditional_loss = unconditional_error.mean()
+    counterfactual_loss = (
+        color_counterfactual_error.mean()
+        + direction_counterfactual_error.mean()
+        + shape_counterfactual_error.mean()
+    ) / 3.0
+    semantic_direction_loss, semantic_color_loss, semantic_shape_loss = (
+        _semantic_conditioning_losses(
             components=components,
-            noisy_latents=noisy_latents,
-            timesteps=timesteps,
+            clean_latents=latents,
             captions=captions,
             cfg=cfg,
             device=device,
         )
     )
-    conditioned_error = _per_sample_mse(conditioned, noise)
-    color_counterfactual_error = _per_sample_mse(color_counterfactual, noise)
-    direction_counterfactual_error = _per_sample_mse(direction_counterfactual, noise)
-    unconditional_error = _per_sample_mse(unconditional, noise)
-    color_gap = color_counterfactual_error - conditioned_error
-    direction_gap = direction_counterfactual_error - conditioned_error
-    contrast_loss = 0.5 * (
-        F.relu(cfg.m1.prompt_contrast_margin - color_gap).mean()
-        + F.relu(cfg.m1.prompt_contrast_margin - direction_gap).mean()
-    )
-    diffusion_loss = conditioned_error.mean()
-    unconditional_loss = unconditional_error.mean()
-    counterfactual_loss = 0.5 * (
-        color_counterfactual_error.mean() + direction_counterfactual_error.mean()
-    )
-    semantic_direction_loss, semantic_color_loss = _semantic_conditioning_losses(
-        components=components,
-        clean_latents=latents,
-        captions=captions,
-        cfg=cfg,
-        device=device,
-    )
     full_rollout_direction_loss = latents.new_zeros(())
     full_rollout_color_loss = latents.new_zeros(())
+    full_rollout_shape_loss = latents.new_zeros(())
     if run_full_rollout:
-        full_rollout_direction_loss, full_rollout_color_loss = _sampler_aligned_losses(
+        (
+            full_rollout_direction_loss,
+            full_rollout_color_loss,
+            full_rollout_shape_loss,
+        ) = _sampler_aligned_losses(
             components=components,
             clean_latents=latents,
             captions=captions,
@@ -548,8 +746,10 @@ def diffusion_train_step(
         + cfg.m1.prompt_contrast_weight * contrast_loss
         + cfg.m1.semantic_direction_weight * semantic_direction_loss
         + cfg.m1.semantic_color_weight * semantic_color_loss
+        + cfg.m1.semantic_shape_weight * semantic_shape_loss
         + cfg.m1.full_rollout_direction_weight * full_rollout_direction_loss
         + cfg.m1.full_rollout_color_weight * full_rollout_color_loss
+        + cfg.m1.full_rollout_shape_weight * full_rollout_shape_loss
     )
     torch.autograd.backward(optimization_loss)
     trainable = [*components.text_encoder.parameters(), *components.dit.parameters()]
@@ -574,10 +774,13 @@ def diffusion_train_step(
         prompt_contrast_loss=contrast_value,
         color_prompt_gap=float(color_gap.detach().mean().item()),
         direction_prompt_gap=float(direction_gap.detach().mean().item()),
+        shape_prompt_gap=float(shape_gap.detach().mean().item()),
         semantic_direction_loss=float(semantic_direction_loss.detach().item()),
         semantic_color_loss=float(semantic_color_loss.detach().item()),
+        semantic_shape_loss=float(semantic_shape_loss.detach().item()),
         full_rollout_direction_loss=float(full_rollout_direction_loss.detach().item()),
         full_rollout_color_loss=float(full_rollout_color_loss.detach().item()),
+        full_rollout_shape_loss=float(full_rollout_shape_loss.detach().item()),
     )
 
 
@@ -673,7 +876,7 @@ def validate_stage_b(
     dataset: StageBSyntheticDataset,
     cfg: ProjectConfig,
     device: torch.device,
-) -> tuple[float, float, float, float, float, float]:
+) -> tuple[float, float, float, float, float, float, float, float]:
     components.vae.eval()
     components.text_encoder.eval()
     components.dit.eval()
@@ -682,8 +885,10 @@ def validate_stage_b(
     diffusion_total = 0.0
     color_gap_total = 0.0
     direction_gap_total = 0.0
+    shape_gap_total = 0.0
     semantic_direction_total = 0.0
     semantic_color_total = 0.0
+    semantic_shape_total = 0.0
     count = 0
 
     with torch.no_grad():
@@ -710,29 +915,35 @@ def validate_stage_b(
                 dtype=latents.dtype,
             )
             noisy = components.schedule.add_noise(latents, noise, timesteps)
-            conditioned, color_counterfactual, direction_counterfactual, _ = (
-                _conditioning_predictions(
-                    components=components,
-                    noisy_latents=noisy,
-                    timesteps=timesteps,
-                    captions=captions,
-                    cfg=cfg,
-                    device=device,
-                )
+            (
+                conditioned,
+                color_counterfactual,
+                direction_counterfactual,
+                shape_counterfactual,
+                _,
+            ) = _conditioning_predictions(
+                components=components,
+                noisy_latents=noisy,
+                timesteps=timesteps,
+                captions=captions,
+                cfg=cfg,
+                device=device,
             )
             conditioned_error = _per_sample_mse(conditioned, noise)
             color_error = _per_sample_mse(color_counterfactual, noise)
             direction_error = _per_sample_mse(direction_counterfactual, noise)
+            shape_error = _per_sample_mse(shape_counterfactual, noise)
             diff_loss = conditioned_error.mean()
             color_gap = (color_error - conditioned_error).mean()
             direction_gap = (direction_error - conditioned_error).mean()
+            shape_gap = (shape_error - conditioned_error).mean()
             semantic_noise = torch.randn(
                 latents.shape,
                 generator=generator,
                 device=device,
                 dtype=latents.dtype,
             )
-            semantic_direction, semantic_color = _semantic_conditioning_losses(
+            semantic_direction, semantic_color, semantic_shape = _semantic_conditioning_losses(
                 components=components,
                 clean_latents=latents,
                 captions=captions,
@@ -744,16 +955,20 @@ def validate_stage_b(
             diffusion_total += float(diff_loss.item()) * len(indices)
             color_gap_total += float(color_gap.item()) * len(indices)
             direction_gap_total += float(direction_gap.item()) * len(indices)
+            shape_gap_total += float(shape_gap.item()) * len(indices)
             semantic_direction_total += float(semantic_direction.item()) * len(indices)
             semantic_color_total += float(semantic_color.item()) * len(indices)
+            semantic_shape_total += float(semantic_shape.item()) * len(indices)
             count += len(indices)
     return (
         reconstruction_total / count,
         diffusion_total / count,
         color_gap_total / count,
         direction_gap_total / count,
+        shape_gap_total / count,
         semantic_direction_total / count,
         semantic_color_total / count,
+        semantic_shape_total / count,
     )
 
 
@@ -762,7 +977,7 @@ def _validation_generation_metrics(
     components: StageBComponents,
     cfg: ProjectConfig,
     device: torch.device,
-) -> tuple[float, float, float, float]:
+) -> tuple[float, float, float, float, float, float, float, float]:
     """Measure fixed validation-split generation at the full frozen sampler horizon."""
     from vexa_video.training.evaluation import evaluate_generated_videos
 
@@ -801,8 +1016,12 @@ def _validation_generation_metrics(
     return (
         metrics.direction_accuracy,
         metrics.color_accuracy,
+        metrics.shape_accuracy,
         metrics.mean_motion,
         metrics.static_rate,
+        metrics.object_like_frame_rate,
+        metrics.persistent_video_rate,
+        metrics.mean_foreground_area_ratio,
     )
 
 
@@ -923,7 +1142,7 @@ def _save_checkpoint(
             "curriculum": "one object; four directions; four colors; square/circle; medium speed",
             "conditioning": (
                 "byte-text only; token attention + text counterfactuals + "
-                "decoded semantic losses + balanced full-horizon motion/color preservation"
+                "decoded semantic losses + balanced full-horizon motion/color/shape preservation"
             ),
         },
     )
@@ -995,8 +1214,11 @@ def train_stage_b(
         resume_m1 = raw_resume_config.get("m1", {}) if isinstance(raw_resume_config, dict) else {}
         current_selector_keys = {
             "full_rollout_color_weight",
+            "full_rollout_shape_weight",
             "full_rollout_min_motion",
             "validation_generation_samples",
+            "generation_shape_gate",
+            "generation_persistent_video_gate",
         }
         if not isinstance(resume_m1, dict) or not current_selector_keys.issubset(resume_m1):
             best_validation_score = math.inf
@@ -1176,10 +1398,13 @@ def train_stage_b(
                 f"contrast={last_metrics.prompt_contrast_loss:.6f} "
                 f"color_gap={last_metrics.color_prompt_gap:.6f} "
                 f"direction_gap={last_metrics.direction_prompt_gap:.6f} "
+                f"shape_gap={last_metrics.shape_prompt_gap:.6f} "
                 f"semantic_direction={last_metrics.semantic_direction_loss:.6f} "
                 f"semantic_color={last_metrics.semantic_color_loss:.6f} "
+                f"semantic_shape={last_metrics.semantic_shape_loss:.6f} "
                 f"full_rollout_direction={last_metrics.full_rollout_direction_loss:.6f} "
                 f"full_rollout_color={last_metrics.full_rollout_color_loss:.6f} "
+                f"full_rollout_shape={last_metrics.full_rollout_shape_loss:.6f} "
                 f"total={last_metrics.total_loss:.6f} "
                 f"grad_norm={last_metrics.gradient_norm:.6f}"
             )
@@ -1193,23 +1418,30 @@ def train_stage_b(
                 validation_diffusion,
                 validation_color_gap,
                 validation_direction_gap,
+                validation_shape_gap,
                 validation_semantic_direction,
                 validation_semantic_color,
+                validation_semantic_shape,
             ) = validate_stage_b(
                 components=components,
                 dataset=validation_dataset,
                 cfg=cfg,
                 device=device,
             )
-            conditioning_penalty = 0.5 * (
+            conditioning_penalty = (
                 max(0.0, cfg.m1.prompt_contrast_margin - validation_color_gap)
                 + max(0.0, cfg.m1.prompt_contrast_margin - validation_direction_gap)
-            )
+                + max(0.0, cfg.m1.prompt_contrast_margin - validation_shape_gap)
+            ) / 3.0
             (
                 validation_generated_direction,
                 validation_generated_color,
+                validation_generated_shape,
                 validation_generated_motion,
                 validation_generated_static,
+                validation_generated_object_like,
+                validation_generated_persistent,
+                validation_generated_area_ratio,
             ) = _validation_generation_metrics(
                 components=components,
                 cfg=cfg,
@@ -1229,6 +1461,13 @@ def train_stage_b(
                 )
                 / cfg.m1.generation_color_gate
             )
+            generated_shape_penalty = (
+                max(
+                    0.0,
+                    cfg.m1.generation_shape_gate - validation_generated_shape,
+                )
+                / cfg.m1.generation_shape_gate
+            )
             generated_static_penalty = max(
                 0.0,
                 validation_generated_static - cfg.m1.generation_static_rate_gate,
@@ -1240,8 +1479,38 @@ def train_stage_b(
                 )
                 / cfg.m1.generation_mean_motion_gate
             )
+            generated_object_like_penalty = (
+                max(
+                    0.0,
+                    cfg.m1.generation_object_like_frame_gate - validation_generated_object_like,
+                )
+                / cfg.m1.generation_object_like_frame_gate
+            )
+            generated_persistent_penalty = (
+                max(
+                    0.0,
+                    cfg.m1.generation_persistent_video_gate - validation_generated_persistent,
+                )
+                / cfg.m1.generation_persistent_video_gate
+            )
+            if validation_generated_area_ratio < cfg.m1.generation_foreground_area_ratio_min:
+                generated_area_penalty = (
+                    cfg.m1.generation_foreground_area_ratio_min - validation_generated_area_ratio
+                ) / cfg.m1.generation_foreground_area_ratio_min
+            elif validation_generated_area_ratio > cfg.m1.generation_foreground_area_ratio_max:
+                generated_area_penalty = (
+                    validation_generated_area_ratio - cfg.m1.generation_foreground_area_ratio_max
+                ) / cfg.m1.generation_foreground_area_ratio_max
+            else:
+                generated_area_penalty = 0.0
             generated_other_penalty = (
-                generated_color_penalty + generated_static_penalty + generated_motion_penalty
+                generated_color_penalty
+                + generated_shape_penalty
+                + generated_static_penalty
+                + generated_motion_penalty
+                + generated_object_like_penalty
+                + generated_persistent_penalty
+                + generated_area_penalty
             )
             validation_score = (
                 cfg.m1.reconstruction_weight * validation_reconstruction
@@ -1249,6 +1518,7 @@ def train_stage_b(
                 + cfg.m1.prompt_contrast_weight * conditioning_penalty
                 + cfg.m1.semantic_direction_weight * validation_semantic_direction
                 + cfg.m1.semantic_color_weight * validation_semantic_color
+                + cfg.m1.semantic_shape_weight * validation_semantic_shape
                 + cfg.m1.validation_generation_direction_weight * generated_direction_penalty
                 + cfg.m1.validation_generation_other_weight * generated_other_penalty
             )
@@ -1258,17 +1528,27 @@ def train_stage_b(
                 "validation_diffusion_loss": validation_diffusion,
                 "validation_color_prompt_gap": validation_color_gap,
                 "validation_direction_prompt_gap": validation_direction_gap,
+                "validation_shape_prompt_gap": validation_shape_gap,
                 "validation_conditioning_penalty": conditioning_penalty,
                 "validation_semantic_direction_loss": validation_semantic_direction,
                 "validation_semantic_color_loss": validation_semantic_color,
+                "validation_semantic_shape_loss": validation_semantic_shape,
                 "validation_generated_direction_accuracy": validation_generated_direction,
                 "validation_generated_color_accuracy": validation_generated_color,
+                "validation_generated_shape_accuracy": validation_generated_shape,
                 "validation_generated_mean_motion": validation_generated_motion,
                 "validation_generated_static_rate": validation_generated_static,
+                "validation_generated_object_like_frame_rate": validation_generated_object_like,
+                "validation_generated_persistent_video_rate": validation_generated_persistent,
+                "validation_generated_foreground_area_ratio": validation_generated_area_ratio,
                 "validation_generated_direction_penalty": generated_direction_penalty,
                 "validation_generated_color_penalty": generated_color_penalty,
+                "validation_generated_shape_penalty": generated_shape_penalty,
                 "validation_generated_static_penalty": generated_static_penalty,
                 "validation_generated_motion_penalty": generated_motion_penalty,
+                "validation_generated_object_like_penalty": generated_object_like_penalty,
+                "validation_generated_persistent_penalty": generated_persistent_penalty,
+                "validation_generated_area_penalty": generated_area_penalty,
                 "validation_generated_other_penalty": generated_other_penalty,
                 "validation_score": validation_score,
                 "vae_visual_direction_accuracy": vae_direction,
@@ -1317,12 +1597,18 @@ def train_stage_b(
                 f"diffusion={validation_diffusion:.6f} "
                 f"color_gap={validation_color_gap:.6f} "
                 f"direction_gap={validation_direction_gap:.6f} "
+                f"shape_gap={validation_shape_gap:.6f} "
                 f"semantic_direction={validation_semantic_direction:.6f} "
                 f"semantic_color={validation_semantic_color:.6f} "
+                f"semantic_shape={validation_semantic_shape:.6f} "
                 f"generated_direction={validation_generated_direction:.6f} "
                 f"generated_color={validation_generated_color:.6f} "
+                f"generated_shape={validation_generated_shape:.6f} "
                 f"generated_motion={validation_generated_motion:.6f} "
                 f"generated_static={validation_generated_static:.6f} "
+                f"generated_object_like={validation_generated_object_like:.6f} "
+                f"generated_persistent={validation_generated_persistent:.6f} "
+                f"generated_area_ratio={validation_generated_area_ratio:.6f} "
                 f"score={validation_score:.6f}"
             )
 

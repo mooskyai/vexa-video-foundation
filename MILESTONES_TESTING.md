@@ -61,10 +61,10 @@ Correctness requirements:
 - VAE reconstruction is measured separately and must pass the foreground-aware reconstruction safety gate before diffusion starts;
 - diffusion training predicts epsilon from noisy VAE latents conditioned through the project-owned byte tokenizer/text Transformer;
 - text conditioning includes pooled text plus parameter-free token-level attention using the existing learned text projection;
-- training compares the correct caption against one-word color and direction counterfactual captions and a null caption; no structured direction/color labels are fed into the denoiser;
+- training compares the correct caption against one-word color, direction, and shape counterfactual captions plus a null caption; no structured direction/color/shape labels are fed into the denoiser;
 - corrective training deliberately oversamples the high-noise half of the diffusion schedule so prompt semantics cannot be bypassed by relying only on nearly-clean visual latents;
 - Video DiT receives explicit deterministic temporal/spatial patch positions;
-- training reports reconstruction loss, diffusion loss, total loss, gradient norm, counterfactual/null losses, color/direction prompt-loss gaps and decoded semantic direction/color losses;
+- training reports reconstruction loss, diffusion loss, total loss, gradient norm, counterfactual/null losses, color/direction/shape prompt-loss gaps and decoded semantic direction/color/shape losses;
 - Stage-B-v3 computes a differentiable soft-centroid motion loss on decoded predicted-clean video at a fixed noisy timestep, including a one-word direction-counterfactual target; semantic labels supervise the loss only and are not model inputs;
 - reverse diffusion starts from Gaussian latent noise and is deterministic for fixed model/config/seed;
 - final sampling uses the configured deterministic classifier-free guidance scale;
@@ -77,7 +77,7 @@ Evaluation protocol:
 
 - first record an untrained/random model using exactly the same generation/evaluation path;
 - use 64 generated videos for the frozen final candidate protocol;
-- balance the four directions and four colors;
+- balance the four directions, four colors, and two shapes;
 - use fixed test-split prompts/seeds;
 - use 50 deterministic reverse-diffusion steps for the final candidate;
 - measure direction from generated temporal motion;
@@ -95,19 +95,17 @@ Requested labels are ground truth only. The evaluator must infer its answer from
 Frozen final M1 thresholds:
 
 ```text
-direction_accuracy >= 0.75
-color_accuracy     >= 0.75
-static_rate        <= 0.10
-mean_motion        > 0.02
+direction_accuracy             >= 0.75
+color_accuracy                 >= 0.75
+shape_accuracy                 >= 0.75
+static_rate                    <= 0.10
+mean_motion                    > 0.02
+object_like_frame_rate         >= 0.90
+persistent_video_rate          >= 0.90
+0.75 <= mean_foreground_area_ratio <= 1.50
 ```
 
-The four thresholds above remain frozen and are not lowered. A manual generated-video review after
-the first passing result exposed an additional visual-fidelity gap: shape and object persistence were
-not part of the original quantitative gate. The new shape/persistence measurements are introduced as
-diagnostics before setting their thresholds, so the project does not tune a gate around one checkpoint.
-Until those diagnostics are recorded for the accepted checkpoint and same-protocol random baseline,
-their thresholds are frozen, and the resulting complete gate passes, M1 remains open and M2 remains
-blocked. The existing `gate_passed` field refers only to the original four-metric control gate.
+The original direction/color/static/motion thresholds remain unchanged. The visual-fidelity thresholds are now frozen before corrected diffusion training, after the independent VAE representation passed its stricter reconstruction gate. `gate_passed=True` therefore requires both control and visual-fidelity criteria; M2 remains blocked until the complete generated-video gate passes and materially beats the same-protocol random baseline.
 
 The VAE isolation run then established that the old 4x spatial latent contract was itself unable to
 preserve square/circle identity: direction/color/object presence were retained, but shape accuracy was
@@ -134,7 +132,9 @@ failed shape identity. A trajectory-aligned true-vs-opposite silhouette diagnost
 8x8 pixels before another VAE-only run. This makes square/circle geometry measurable without
 changing motion speed, directions, colors, frame count, camera behavior, or the frozen gates above.
 
-The 8x8 controlled footprint with the same 2x-spatial VAE passed the frozen VAE gate after extending warmup from 400 to 800 steps: reconstruction `0.005050`, direction `1.000000`, color `1.000000`, shape `0.984375`, object-like frame rate `1.000000`, persistent-video rate `1.000000`, and foreground-area ratio `1.044366`. VAE representation quality is therefore no longer the M1 blocker; corrected diffusion training may proceed, but M1 remains open until complete generated videos pass the final control and visual-fidelity gates.
+The 8x8 controlled footprint with the same 2x-spatial VAE passed the frozen VAE gate after extending warmup from 400 to 800 steps: reconstruction `0.005050`, direction `1.000000`, color `1.000000`, shape `0.984375`, object-like frame rate `1.000000`, persistent-video rate `1.000000`, and foreground-area ratio `1.044366`. VAE representation quality is therefore no longer the M1 blocker. Corrected diffusion training adds shape-word counterfactuals, a differentiable decoded shape objective, shape preservation on the existing full-horizon rollout, and visual-fidelity-aware checkpoint selection without adding structured shape inputs or another sampler pass. M1 remains open until complete generated videos pass the final gate above.
+
+The first shape-aware diffusion run still failed visual fidelity. Its selected `best.pt` at diffusion step 1100 had shape `0.500000`, object-like frame rate `0.687500`, persistence `0.187500`, and foreground-area ratio `3.270386`. At step 12600, decoded/full-rollout shape proxy losses were near zero, but generated shape remained `0.500000`, persistence was `0.000000`, and foreground-area ratio was `4.019705`. This is an objective-alignment failure, not a reason to lower gates. The correction adds a differentiable per-frame foreground-area term to the existing semantic and sampler-aligned shape losses so both blob expansion and frame-level disappearance receive gradient. The next run starts from the independently passing VAE-only checkpoint at `diffusion_step=0`; the failed diffusion checkpoints remain experiment evidence only.
 
 Stage-B v1 recorded a random baseline of direction `0.265625`, color `0.250000`, mean motion
 `0.009729`, static rate `1.000000`. Its trained `best.pt` reached direction `0.312500`, color
