@@ -23,6 +23,7 @@ from vexa_video.training.trainer import (
     build_stage_b_components,
     diffusion_train_step,
     load_stage_b_weights,
+    reconstruction_loss,
 )
 
 
@@ -48,6 +49,12 @@ def _tiny_test_config() -> ProjectConfig:
             full_rollout_steps=2,
             full_rollout_every=1,
             validation_generation_samples=16,
+            vae_visual_validation_samples=32,
+            vae_semantic_accuracy_gate=0.0,
+            vae_object_like_frame_gate=0.0,
+            vae_persistent_video_gate=0.0,
+            vae_foreground_area_ratio_min=0.0,
+            vae_foreground_area_ratio_max=1_000_000.0,
         ),
     )
 
@@ -97,6 +104,23 @@ def test_soft_video_features_recover_cardinal_direction_and_color() -> None:
     assert motion[2, 1] > 0
     assert motion[3, 1] < 0
     assert color.shape == (4, 3)
+
+
+def test_reconstruction_loss_penalizes_diffuse_foreground() -> None:
+    sample = StageBSyntheticDataset(
+        length=1,
+        frames=8,
+        size=32,
+        base_seed=42,
+        split="train",
+    ).sample(0)
+    target = sample.video.unsqueeze(0)
+    diffuse = torch.full_like(target, -1.0)
+    diffuse[:, :, :, 4:28, 4:28] = 0.5
+    exact = reconstruction_loss(target, target, silhouette_weight=1.0)
+    diffuse_loss = reconstruction_loss(diffuse, target, silhouette_weight=1.0)
+    assert exact == 0.0
+    assert diffuse_loss > exact
 
 
 def test_diffusion_train_step_is_finite_and_reaches_text_and_dit() -> None:
@@ -271,13 +295,13 @@ def test_guided_ddim_rollout_preserves_training_gradients() -> None:
 
 def test_generated_metrics_identify_cardinal_synthetic_videos() -> None:
     dataset = StageBSyntheticDataset(
-        length=16,
+        length=32,
         frames=8,
         size=32,
         base_seed=42,
         split="test",
     )
-    samples = [dataset.sample(index) for index in range(16)]
+    samples = [dataset.sample(index) for index in range(32)]
     videos = torch.stack([sample.video for sample in samples])
     metrics = evaluate_generated_videos(
         videos,
@@ -287,9 +311,36 @@ def test_generated_metrics_identify_cardinal_synthetic_videos() -> None:
     )
     assert metrics.direction_accuracy == 1.0
     assert metrics.color_accuracy == 1.0
+    assert metrics.shape_accuracy == 1.0
     assert metrics.static_rate == 0.0
     assert metrics.mean_motion > 0.02
+    assert metrics.object_like_frame_rate == 1.0
+    assert metrics.persistent_video_rate == 1.0
+    assert metrics.mean_foreground_area_ratio == 1.0
+    assert metrics.shape_confusion == [[16, 0], [0, 16]]
     assert passes_m1_generation_gate(metrics, _tiny_test_config())
+
+
+def test_visual_fidelity_diagnostics_reject_diffuse_foreground() -> None:
+    dataset = StageBSyntheticDataset(
+        length=16,
+        frames=8,
+        size=32,
+        base_seed=42,
+        split="test",
+    )
+    samples = [dataset.sample(index) for index in range(16)]
+    videos = torch.full((16, 3, 8, 32, 32), -1.0)
+    videos[:, :, :, 4:28, 4:28] = 0.5
+    metrics = evaluate_generated_videos(
+        videos,
+        [sample.control for sample in samples],
+        static_motion_threshold=0.02,
+        sampling_steps=2,
+    )
+    assert metrics.object_like_frame_rate == 0.0
+    assert metrics.persistent_video_rate == 0.0
+    assert metrics.mean_foreground_area_ratio > 4.0
 
 
 def test_training_checkpoint_round_trip(tmp_path: Path) -> None:

@@ -19,6 +19,13 @@ _STAGE_B_SPLIT_OFFSETS: dict[str, int] = {
 }
 
 
+def controlled_motion_shape_size(size: int) -> int:
+    """Return the shape footprint used by the controlled M1 curriculum."""
+    if size < 16:
+        raise ValueError("controlled motion size must be >= 16")
+    return max(4, size // 4)
+
+
 def stage_b_control(index: int) -> SyntheticControl:
     """Balanced Stage-B curriculum with fixed medium constant velocity."""
     return SyntheticControl(
@@ -64,6 +71,7 @@ class StageBSyntheticDataset(Dataset[tuple[Tensor, str, Tensor]]):
             size=self.size,
             seed=seed,
             control=stage_b_control(index),
+            shape_size=controlled_motion_shape_size(self.size),
         )
 
     def __getitem__(self, index: int) -> tuple[Tensor, str, Tensor]:

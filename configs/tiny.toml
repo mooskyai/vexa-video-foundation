@@ -18,7 +18,7 @@ ff_mult = 4
 in_channels = 3
 latent_channels = 4
 base_channels = 16
-spatial_downsample = 4
+spatial_downsample = 2
 temporal_downsample = 2
 
 [dit]
@@ -47,8 +47,15 @@ validation_samples = 256
 batch_size = 8
 learning_rate = 0.0003
 vae_learning_rate = 0.001
-vae_warmup_steps = 400
+vae_warmup_steps = 800
 vae_reconstruction_gate = 0.20
+vae_silhouette_weight = 1.0
+vae_visual_validation_samples = 64
+vae_semantic_accuracy_gate = 0.95
+vae_object_like_frame_gate = 0.95
+vae_persistent_video_gate = 0.95
+vae_foreground_area_ratio_min = 0.75
+vae_foreground_area_ratio_max = 1.50
 max_steps = 13000
 checkpoint_every = 100
 log_every = 20

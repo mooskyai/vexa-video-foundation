@@ -110,6 +110,50 @@ static_rate=0.000000
 gate_passed=True
 ```
 
+Manual review of a generated MP4 exposed a quality gap that the original four metrics did not
+measure: a clip can move in the requested direction and retain the requested color while the object
+is diffuse, deformed, or disappears across frames. M1 is therefore reopened before M2. The evaluator
+now also reports shape accuracy, object-like frame rate, persistent-video rate, foreground-area
+ratio, and a shape confusion matrix. These new measurements are diagnostic first; their final exit
+thresholds are frozen only after recording the current checkpoint and same-protocol random baseline.
+
+`gate_passed=True` currently means the original direction/color/motion/static control gate passed.
+It is not sufficient by itself to close M1 until the visual-fidelity diagnostics have frozen
+thresholds and passed them.
+
+The follow-up VAE isolation test localized the first visual-fidelity failure. Reconstruction of the
+64 deterministic test videos retained direction/color and object persistence perfectly, but shape
+accuracy was only `0.515625` and the mean detected foreground occupied `2.075480x` the renderer's
+expected object area. At 32x32 the renderer's default object is 4x4 pixels; the previous 4x spatial
+VAE compression reduced that entire shape to roughly one latent cell. M1 therefore now uses 2x
+spatial and 2x temporal compression so square/circle geometry has a larger latent footprint.
+
+Before any corrected diffusion training, the VAE must independently pass a frozen reconstruction
+gate: direction/color/shape accuracy >= `0.95`, object-like frame rate >= `0.95`, persistent-video
+rate >= `0.95`, and mean foreground-area ratio in `[0.75, 1.50]`. The reconstruction objective also
+includes a balanced silhouette term that penalizes missing foreground and diffuse background bleed.
+
+The first 2x-spatial recovery run preserved direction, color, visibility and persistence, but it still
+collapsed circle geometry: trajectory-aligned template evaluation classified every square correctly
+and every circle incorrectly (`0.500000` aggregate shape accuracy, silhouette IoU `0.673023`). At
+32x32 the original controlled object was only 4x4 pixels, so square and circle differed by just four
+corner pixels. The controlled M1 curriculum now uses an 8x8 object footprint at 32x32 while keeping
+the same direction/color/shape/speed vocabulary, static camera, frame count and resolution. Generic
+M0 synthetic rendering remains unchanged.
+
+Extending the same 8x8/2x-spatial VAE from 400 to 800 warmup steps cleared the frozen VAE gate without changing the objective or thresholds: reconstruction `0.005050`, direction `1.000000`, color `1.000000`, shape `0.984375`, object-like frame rate `1.000000`, persistent-video rate `1.000000`, and foreground-area ratio `1.044366`. The canonical tiny configuration therefore uses 800 VAE warmup steps before corrected diffusion training.
+
+Validate the replacement latent representation without spending a diffusion run:
+
+```powershell
+uv run vexa-video train --config configs/tiny.toml `
+  --run-dir runs/synthetic-motion-shape-recovery --vae-only --cuda
+```
+
+Only a checkpoint produced by this new 2x-spatial latent contract may be used for the corrected
+diffusion run. The previous 4x-spatial M1 checkpoint remains historical evidence and is intentionally
+rejected by the new checkpoint compatibility check.
+
 The same-protocol random baseline is:
 
 ```text
@@ -177,7 +221,9 @@ uv run vexa-video generate `
   --cuda
 ```
 
-The accepted pre-consolidation checkpoint remains compatible with this code. Re-run the frozen evaluation after applying the consolidation patch before unlocking the next research milestone.
+The earlier 4x-spatial synthetic-motion checkpoint is no longer compatible after the shape-recovery
+latent-contract correction. Preserve it as experiment evidence; train a clean 2x-spatial candidate
+and pass the VAE gate before starting corrected diffusion training. M2 remains blocked.
 
 ## Development checks
 

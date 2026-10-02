@@ -1,5 +1,9 @@
 import torch
 
+from vexa_video.data.controlled_motion import (
+    StageBSyntheticDataset,
+    controlled_motion_shape_size,
+)
 from vexa_video.data.synthetic import (
     COLORS,
     DIRECTIONS,
@@ -54,3 +58,21 @@ def test_dataset_balances_direction_and_color_and_separates_split_seeds() -> Non
     assert {train.seed_for_index(index) for index in range(16)}.isdisjoint(
         {test.seed_for_index(index) for index in range(16)}
     )
+
+
+def test_controlled_motion_uses_shape_resolving_object_footprint() -> None:
+    dataset = StageBSyntheticDataset(
+        length=32,
+        frames=8,
+        size=32,
+        base_seed=42,
+        split="train",
+    )
+    square = dataset.sample(0)
+    circle = dataset.sample(16)
+
+    assert controlled_motion_shape_size(32) == 8
+    square_mask = square.video[:, 0].amax(dim=0) > -0.9
+    circle_mask = circle.video[:, 0].amax(dim=0) > -0.9
+    assert int(square_mask.sum().item()) == 64
+    assert int(circle_mask.sum().item()) == 52

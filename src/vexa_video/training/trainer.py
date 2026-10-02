@@ -82,6 +82,8 @@ def build_stage_b_components(cfg: ProjectConfig, *, device: torch.device) -> Sta
         in_channels=cfg.vae.in_channels,
         latent_channels=cfg.vae.latent_channels,
         base_channels=cfg.vae.base_channels,
+        spatial_downsample=cfg.vae.spatial_downsample,
+        temporal_downsample=cfg.vae.temporal_downsample,
     ).to(device)
     dit = VideoDiT(
         latent_channels=cfg.vae.latent_channels,
@@ -105,18 +107,41 @@ def build_stage_b_components(cfg: ProjectConfig, *, device: torch.device) -> Sta
     )
 
 
-def reconstruction_loss(reconstruction: Tensor, target: Tensor) -> Tensor:
-    """Pixel MSE plus foreground-weighted MSE so background collapse cannot look healthy."""
+def reconstruction_loss(
+    reconstruction: Tensor,
+    target: Tensor,
+    *,
+    silhouette_weight: float = 0.0,
+) -> Tensor:
+    """Pixel/color reconstruction plus balanced foreground-silhouette preservation."""
     if reconstruction.shape != target.shape:
         raise ValueError("reconstruction and target must have identical shapes")
+    if silhouette_weight < 0:
+        raise ValueError("silhouette_weight must be non-negative")
     pixel_loss = F.mse_loss(reconstruction, target)
     foreground = target.amax(dim=1, keepdim=True).gt(-0.9)
     expanded = foreground.expand_as(target).to(dtype=target.dtype)
     foreground_count = expanded.sum()
-    if float(foreground_count.item()) == 0.0:
-        return pixel_loss
-    foreground_loss = ((reconstruction - target).square() * expanded).sum() / foreground_count
-    return pixel_loss + foreground_loss
+    foreground_loss = pixel_loss.new_zeros(())
+    if float(foreground_count.item()) > 0.0:
+        foreground_loss = ((reconstruction - target).square() * expanded).sum() / foreground_count
+
+    target_silhouette = foreground.to(dtype=target.dtype)
+    predicted_silhouette = ((reconstruction + 1.0) * 0.5).clamp(0.0, 1.0).amax(dim=1, keepdim=True)
+    silhouette_error = (predicted_silhouette - target_silhouette).square()
+    background_silhouette = 1.0 - target_silhouette
+    silhouette_loss = pixel_loss.new_zeros(())
+    target_count = target_silhouette.sum()
+    background_count = background_silhouette.sum()
+    if float(target_count.item()) > 0.0:
+        silhouette_loss = (
+            silhouette_loss + (silhouette_error * target_silhouette).sum() / target_count
+        )
+    if float(background_count.item()) > 0.0:
+        silhouette_loss = (
+            silhouette_loss + (silhouette_error * background_silhouette).sum() / background_count
+        )
+    return pixel_loss + foreground_loss + silhouette_weight * silhouette_loss
 
 
 def _sample_batch(
@@ -424,7 +449,11 @@ def vae_warmup_step(
     components.vae.train()
     optimizer.zero_grad(set_to_none=True)
     reconstruction, _ = components.vae(videos)
-    recon_loss = reconstruction_loss(reconstruction, videos)
+    recon_loss = reconstruction_loss(
+        reconstruction,
+        videos,
+        silhouette_weight=cfg.m1.vae_silhouette_weight,
+    )
     optimization_loss = cfg.m1.reconstruction_weight * recon_loss
     torch.autograd.backward(optimization_loss)
     grad_norm = torch.nn.utils.clip_grad_norm_(components.vae.parameters(), cfg.m1.grad_clip)
@@ -455,7 +484,11 @@ def diffusion_train_step(
 
     with torch.no_grad():
         reconstruction, latents = components.vae(videos)
-        recon_loss = reconstruction_loss(reconstruction, videos)
+        recon_loss = reconstruction_loss(
+            reconstruction,
+            videos,
+            silhouette_weight=cfg.m1.vae_silhouette_weight,
+        )
     timesteps = _sample_training_timesteps(
         batch_size=videos.shape[0],
         timesteps=components.schedule.timesteps,
@@ -553,6 +586,7 @@ def _validate_reconstruction(
     components: StageBComponents,
     dataset: StageBSyntheticDataset,
     batch_size: int,
+    cfg: ProjectConfig,
     device: torch.device,
 ) -> float:
     components.vae.eval()
@@ -563,10 +597,74 @@ def _validate_reconstruction(
             indices = list(range(start, min(start + batch_size, len(dataset))))
             videos, _ = _sample_batch(dataset, indices, device=device)
             reconstruction, _ = components.vae(videos)
-            loss = reconstruction_loss(reconstruction, videos)
+            loss = reconstruction_loss(
+                reconstruction,
+                videos,
+                silhouette_weight=cfg.m1.vae_silhouette_weight,
+            )
             total += float(loss.item()) * len(indices)
             count += len(indices)
     return total / count
+
+
+def _validate_vae_visual_fidelity(
+    *,
+    components: StageBComponents,
+    cfg: ProjectConfig,
+    device: torch.device,
+) -> tuple[float, float, float, float, float, float]:
+    """Evaluate whether VAE reconstruction preserves controlled renderer semantics."""
+    from vexa_video.training.evaluation import evaluate_generated_videos
+
+    dataset = StageBSyntheticDataset(
+        length=cfg.m1.vae_visual_validation_samples,
+        frames=cfg.data.frames,
+        size=cfg.data.height,
+        base_seed=cfg.seed,
+        split="validation",
+    )
+    reconstructed_batches: list[Tensor] = []
+    controls: list[SyntheticControl] = []
+    components.vae.eval()
+    with torch.no_grad():
+        for start in range(0, len(dataset), cfg.m1.eval_batch_size):
+            stop = min(start + cfg.m1.eval_batch_size, len(dataset))
+            samples = [dataset.sample(index) for index in range(start, stop)]
+            videos = torch.stack([sample.video for sample in samples]).to(device)
+            reconstruction, _ = components.vae(videos)
+            reconstructed_batches.append(reconstruction.cpu())
+            controls.extend(sample.control for sample in samples)
+    metrics = evaluate_generated_videos(
+        torch.cat(reconstructed_batches, dim=0),
+        controls,
+        static_motion_threshold=cfg.m1.static_motion_threshold,
+        sampling_steps=0,
+    )
+    return (
+        metrics.direction_accuracy,
+        metrics.color_accuracy,
+        metrics.shape_accuracy,
+        metrics.object_like_frame_rate,
+        metrics.persistent_video_rate,
+        metrics.mean_foreground_area_ratio,
+    )
+
+
+def _passes_vae_visual_gate(
+    metrics: tuple[float, float, float, float, float, float], cfg: ProjectConfig
+) -> bool:
+    direction, color, shape, object_like, persistent, area_ratio = metrics
+    semantic_gate = cfg.m1.vae_semantic_accuracy_gate
+    return (
+        direction >= semantic_gate
+        and color >= semantic_gate
+        and shape >= semantic_gate
+        and object_like >= cfg.m1.vae_object_like_frame_gate
+        and persistent >= cfg.m1.vae_persistent_video_gate
+        and cfg.m1.vae_foreground_area_ratio_min
+        <= area_ratio
+        <= cfg.m1.vae_foreground_area_ratio_max
+    )
 
 
 def validate_stage_b(
@@ -593,7 +691,11 @@ def validate_stage_b(
             indices = list(range(start, min(start + cfg.m1.batch_size, len(dataset))))
             videos, captions = _sample_batch(dataset, indices, device=device)
             reconstruction, latents = components.vae(videos)
-            recon_loss = reconstruction_loss(reconstruction, videos)
+            recon_loss = reconstruction_loss(
+                reconstruction,
+                videos,
+                silhouette_weight=cfg.m1.vae_silhouette_weight,
+            )
             timesteps = torch.randint(
                 0,
                 components.schedule.timesteps,
@@ -723,6 +825,33 @@ def _normalize_cuda_rng_states(raw_states: object) -> list[Tensor]:
     return states
 
 
+def _validate_checkpoint_vae_contract(
+    payload: dict[str, Any], components: StageBComponents
+) -> None:
+    raw_config = payload.get("config")
+    if not isinstance(raw_config, dict):
+        return
+    raw_vae = raw_config.get("vae")
+    if not isinstance(raw_vae, dict):
+        return
+    stored_spatial = raw_vae.get("spatial_downsample")
+    stored_temporal = raw_vae.get("temporal_downsample")
+    if stored_spatial is None or stored_temporal is None:
+        return
+    stored_contract = (int(stored_spatial), int(stored_temporal))
+    current_contract = (
+        components.vae.spatial_downsample,
+        components.vae.temporal_downsample,
+    )
+    if stored_contract != current_contract:
+        raise ValueError(
+            "checkpoint VAE compression is incompatible with the current latent contract: "
+            f"checkpoint={stored_contract[0]}x/{stored_contract[1]}x, "
+            f"current={current_contract[0]}x/{current_contract[1]}x. "
+            "Start a clean M1 shape-recovery run instead of resuming this checkpoint."
+        )
+
+
 def _restore_checkpoint(
     *,
     checkpoint_path: Path,
@@ -738,6 +867,7 @@ def _restore_checkpoint(
     payload = cast(dict[str, Any], raw)
     if payload.get("stage") != "stage-b-generative-synthetic-motion":
         raise ValueError("checkpoint is not an M1 Stage-B checkpoint")
+    _validate_checkpoint_vae_contract(payload, components)
     models = cast(dict[str, Any], payload["models"])
     optimizers = cast(dict[str, Any], payload["optimizers"])
     components.vae.load_state_dict(models["vae"])
@@ -807,6 +937,7 @@ def train_stage_b(
     run_dir: str | Path,
     steps: int | None = None,
     resume: str | Path | None = None,
+    vae_only: bool = False,
 ) -> StageBTrainResult:
     if cfg.data.height != cfg.data.width:
         raise ValueError("M1 Stage-B currently requires square video dimensions")
@@ -915,6 +1046,7 @@ def train_stage_b(
         components=components,
         dataset=validation_dataset,
         batch_size=cfg.m1.batch_size,
+        cfg=cfg,
         device=device,
     )
     print(f"m1_stage_b vae_validation_reconstruction={vae_validation_loss:.6f}")
@@ -936,6 +1068,78 @@ def train_stage_b(
             "Stage-B VAE reconstruction safety gate failed: "
             f"{vae_validation_loss:.6f} > {cfg.m1.vae_reconstruction_gate:.6f}. "
             "Diffusion training was not started."
+        )
+
+    vae_visual_metrics = _validate_vae_visual_fidelity(
+        components=components,
+        cfg=cfg,
+        device=device,
+    )
+    (
+        vae_direction,
+        vae_color,
+        vae_shape,
+        vae_object_like,
+        vae_persistent,
+        vae_area_ratio,
+    ) = vae_visual_metrics
+    print(
+        "m1_stage_b vae_visual "
+        f"direction={vae_direction:.6f} "
+        f"color={vae_color:.6f} "
+        f"shape={vae_shape:.6f} "
+        f"object_like={vae_object_like:.6f} "
+        f"persistent={vae_persistent:.6f} "
+        f"foreground_area_ratio={vae_area_ratio:.6f}"
+    )
+    vae_visual_metric_payload = {
+        "vae_validation_reconstruction_loss": vae_validation_loss,
+        "vae_visual_direction_accuracy": vae_direction,
+        "vae_visual_color_accuracy": vae_color,
+        "vae_visual_shape_accuracy": vae_shape,
+        "vae_visual_object_like_frame_rate": vae_object_like,
+        "vae_visual_persistent_video_rate": vae_persistent,
+        "vae_visual_foreground_area_ratio": vae_area_ratio,
+    }
+    if not _passes_vae_visual_gate(vae_visual_metrics, cfg):
+        _save_checkpoint(
+            path=latest_path,
+            components=components,
+            vae_optimizer=vae_optimizer,
+            diffusion_optimizer=diffusion_optimizer,
+            cfg=cfg,
+            vae_step=vae_step,
+            diffusion_step=diffusion_step,
+            best_validation_score=best_validation_score,
+            phase="vae_visual_gate_failed",
+            metrics=vae_visual_metric_payload,
+            data_generator=data_generator,
+        )
+        raise RuntimeError(
+            "M1 VAE visual-fidelity gate failed; diffusion training was not started. "
+            "Inspect the reported direction/color/shape/persistence/foreground-area metrics."
+        )
+
+    if vae_only:
+        _save_checkpoint(
+            path=latest_path,
+            components=components,
+            vae_optimizer=vae_optimizer,
+            diffusion_optimizer=diffusion_optimizer,
+            cfg=cfg,
+            vae_step=vae_step,
+            diffusion_step=diffusion_step,
+            best_validation_score=best_validation_score,
+            phase="vae_ready",
+            metrics=vae_visual_metric_payload,
+            data_generator=data_generator,
+        )
+        return StageBTrainResult(
+            latest_checkpoint=latest_path,
+            best_checkpoint=None,
+            diffusion_step=diffusion_step,
+            vae_validation_reconstruction_loss=vae_validation_loss,
+            best_validation_score=best_validation_score,
         )
 
     _freeze_vae(components.vae)
@@ -1067,6 +1271,12 @@ def train_stage_b(
                 "validation_generated_motion_penalty": generated_motion_penalty,
                 "validation_generated_other_penalty": generated_other_penalty,
                 "validation_score": validation_score,
+                "vae_visual_direction_accuracy": vae_direction,
+                "vae_visual_color_accuracy": vae_color,
+                "vae_visual_shape_accuracy": vae_shape,
+                "vae_visual_object_like_frame_rate": vae_object_like,
+                "vae_visual_persistent_video_rate": vae_persistent,
+                "vae_visual_foreground_area_ratio": vae_area_ratio,
                 "vae_validation_reconstruction_loss": vae_validation_loss,
             }
             if validation_score < best_validation_score:
@@ -1138,6 +1348,7 @@ def load_stage_b_weights(
     payload = cast(dict[str, Any], raw)
     if payload.get("stage") != "stage-b-generative-synthetic-motion":
         raise ValueError("checkpoint is not an M1 Stage-B checkpoint")
+    _validate_checkpoint_vae_contract(payload, components)
     models = cast(dict[str, Any], payload["models"])
     components.vae.load_state_dict(models["vae"])
     components.text_encoder.load_state_dict(models["text_encoder"])

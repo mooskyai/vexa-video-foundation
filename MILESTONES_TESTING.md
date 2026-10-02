@@ -83,6 +83,11 @@ Evaluation protocol:
 - measure direction from generated temporal motion;
 - measure color from generated RGB appearance;
 - report direction accuracy, color accuracy, mean motion, static rate and confusion matrices.
+- report square/circle shape accuracy and a shape confusion matrix;
+- report the fraction of frames whose detected foreground footprint remains within a broad
+  renderer-relative object-size range;
+- report the fraction of videos that preserve that object-like footprint through at least 7/8 frames;
+- report mean detected-foreground area relative to the renderer's expected shape footprint;
 - report the guidance scale and an explicit `gate_passed` result from the frozen thresholds.
 
 Requested labels are ground truth only. The evaluator must infer its answer from generated pixels and temporal movement.
@@ -95,6 +100,41 @@ color_accuracy     >= 0.75
 static_rate        <= 0.10
 mean_motion        > 0.02
 ```
+
+The four thresholds above remain frozen and are not lowered. A manual generated-video review after
+the first passing result exposed an additional visual-fidelity gap: shape and object persistence were
+not part of the original quantitative gate. The new shape/persistence measurements are introduced as
+diagnostics before setting their thresholds, so the project does not tune a gate around one checkpoint.
+Until those diagnostics are recorded for the accepted checkpoint and same-protocol random baseline,
+their thresholds are frozen, and the resulting complete gate passes, M1 remains open and M2 remains
+blocked. The existing `gate_passed` field refers only to the original four-metric control gate.
+
+The VAE isolation run then established that the old 4x spatial latent contract was itself unable to
+preserve square/circle identity: direction/color/object presence were retained, but shape accuracy was
+`0.515625` and mean foreground area was `2.075480x` the renderer footprint. Before any corrected
+diffusion training, the replacement VAE must pass all of the following on 64 balanced validation
+reconstructions:
+
+```text
+direction_accuracy       >= 0.95
+color_accuracy           >= 0.95
+shape_accuracy           >= 0.95
+object_like_frame_rate   >= 0.95
+persistent_video_rate    >= 0.95
+0.75 <= mean_foreground_area_ratio <= 1.50
+```
+
+These thresholds are frozen before training the replacement VAE. Failure blocks diffusion; the
+project must not compensate for a lossy shape representation by adding more DiT supervision.
+
+The first 2x-spatial replacement VAE passed direction/color/object-presence/persistence checks but
+failed shape identity. A trajectory-aligned true-vs-opposite silhouette diagnostic reached only
+`0.500000` shape accuracy: squares `1.000000`, circles `0.000000`, with mean silhouette IoU
+`0.673023`. The controlled 32x32 curriculum therefore increases the object footprint from 4x4 to
+8x8 pixels before another VAE-only run. This makes square/circle geometry measurable without
+changing motion speed, directions, colors, frame count, camera behavior, or the frozen gates above.
+
+The 8x8 controlled footprint with the same 2x-spatial VAE passed the frozen VAE gate after extending warmup from 400 to 800 steps: reconstruction `0.005050`, direction `1.000000`, color `1.000000`, shape `0.984375`, object-like frame rate `1.000000`, persistent-video rate `1.000000`, and foreground-area ratio `1.044366`. VAE representation quality is therefore no longer the M1 blocker; corrected diffusion training may proceed, but M1 remains open until complete generated videos pass the final control and visual-fidelity gates.
 
 Stage-B v1 recorded a random baseline of direction `0.265625`, color `0.250000`, mean motion
 `0.009729`, static rate `1.000000`. Its trained `best.pt` reached direction `0.312500`, color

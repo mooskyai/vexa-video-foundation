@@ -65,6 +65,13 @@ class M1Config:
     vae_learning_rate: float = 1e-3
     vae_warmup_steps: int = 400
     vae_reconstruction_gate: float = 0.20
+    vae_silhouette_weight: float = 1.0
+    vae_visual_validation_samples: int = 64
+    vae_semantic_accuracy_gate: float = 0.95
+    vae_object_like_frame_gate: float = 0.95
+    vae_persistent_video_gate: float = 0.95
+    vae_foreground_area_ratio_min: float = 0.75
+    vae_foreground_area_ratio_max: float = 1.50
     max_steps: int = 2_000
     checkpoint_every: int = 100
     log_every: int = 20
@@ -180,6 +187,22 @@ def validate_config(cfg: ProjectConfig) -> None:
         raise ValueError("m1 VAE warmup/max steps must be positive")
     if cfg.m1.vae_reconstruction_gate <= 0:
         raise ValueError("m1.vae_reconstruction_gate must be positive")
+    if cfg.m1.vae_silhouette_weight < 0:
+        raise ValueError("m1.vae_silhouette_weight must be non-negative")
+    if cfg.m1.vae_visual_validation_samples <= 0 or cfg.m1.vae_visual_validation_samples % 32 != 0:
+        raise ValueError("m1.vae_visual_validation_samples must be a positive multiple of 32")
+    if not 0.0 < cfg.m1.vae_semantic_accuracy_gate <= 1.0:
+        raise ValueError("m1.vae_semantic_accuracy_gate must be in (0, 1]")
+    if not 0.0 < cfg.m1.vae_object_like_frame_gate <= 1.0:
+        raise ValueError("m1.vae_object_like_frame_gate must be in (0, 1]")
+    if not 0.0 < cfg.m1.vae_persistent_video_gate <= 1.0:
+        raise ValueError("m1.vae_persistent_video_gate must be in (0, 1]")
+    if cfg.m1.vae_foreground_area_ratio_min <= 0:
+        raise ValueError("m1.vae_foreground_area_ratio_min must be positive")
+    if cfg.m1.vae_foreground_area_ratio_max <= cfg.m1.vae_foreground_area_ratio_min:
+        raise ValueError(
+            "m1.vae_foreground_area_ratio_max must exceed vae_foreground_area_ratio_min"
+        )
     if cfg.m1.checkpoint_every <= 0 or cfg.m1.log_every <= 0:
         raise ValueError("m1 checkpoint/log intervals must be positive")
     if cfg.m1.reconstruction_weight < 0 or cfg.m1.diffusion_weight <= 0:

@@ -63,6 +63,8 @@ def cmd_smoke(args: argparse.Namespace) -> int:
         in_channels=cfg.vae.in_channels,
         latent_channels=cfg.vae.latent_channels,
         base_channels=cfg.vae.base_channels,
+        spatial_downsample=cfg.vae.spatial_downsample,
+        temporal_downsample=cfg.vae.temporal_downsample,
     ).to(device)
     dit = VideoDiT(
         latent_channels=cfg.vae.latent_channels,
@@ -155,6 +157,7 @@ def cmd_train(args: argparse.Namespace) -> int:
         run_dir=args.run_dir,
         steps=args.steps,
         resume=args.resume,
+        vae_only=args.vae_only,
     )
     print(f"device={device}")
     print(f"diffusion_step={result.diffusion_step}")
@@ -190,10 +193,15 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     print(f"guidance_scale={result.guidance_scale:.6f}")
     print(f"direction_accuracy={result.direction_accuracy:.6f}")
     print(f"color_accuracy={result.color_accuracy:.6f}")
+    print(f"shape_accuracy={result.shape_accuracy:.6f}")
     print(f"mean_motion={result.mean_motion:.6f}")
     print(f"static_rate={result.static_rate:.6f}")
+    print(f"object_like_frame_rate={result.object_like_frame_rate:.6f}")
+    print(f"persistent_video_rate={result.persistent_video_rate:.6f}")
+    print(f"mean_foreground_area_ratio={result.mean_foreground_area_ratio:.6f}")
     print(f"direction_confusion={result.direction_confusion}")
     print(f"color_confusion={result.color_confusion}")
+    print(f"shape_confusion={result.shape_confusion}")
     print(f"gate_passed={result.gate_passed}")
     if output is not None:
         print(f"metrics={output}")
@@ -290,6 +298,11 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--run-dir", default="runs/synthetic-motion")
     train.add_argument("--steps", type=int, help="Override configured diffusion steps")
     train.add_argument("--resume", help="Resume a synthetic-motion checkpoint")
+    train.add_argument(
+        "--vae-only",
+        action="store_true",
+        help="Train and gate the VAE, then stop before diffusion training",
+    )
     train.add_argument("--cuda", action="store_true", help="Require CUDA")
     train.set_defaults(func=cmd_train)
 

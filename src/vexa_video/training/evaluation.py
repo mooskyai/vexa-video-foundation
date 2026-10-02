@@ -8,7 +8,8 @@ import torch
 from torch import Tensor
 
 from vexa_video.config import ProjectConfig
-from vexa_video.data import COLORS, DIRECTIONS, StageBSyntheticDataset, SyntheticControl
+from vexa_video.data import COLORS, DIRECTIONS, SHAPES, StageBSyntheticDataset, SyntheticControl
+from vexa_video.data.controlled_motion import controlled_motion_shape_size
 from vexa_video.inference import sample_video
 from vexa_video.training.trainer import StageBComponents
 
@@ -24,17 +25,24 @@ _COLOR_PROTOTYPES: dict[str, tuple[float, float, float]] = {
 class GeneratedVideoObservation:
     direction: str
     color: str
+    shape: str
     mean_motion: float
+    foreground_pixels: tuple[int, ...]
 
 
 @dataclass(frozen=True, slots=True)
 class M1GenerationMetrics:
     direction_accuracy: float
     color_accuracy: float
+    shape_accuracy: float
     mean_motion: float
     static_rate: float
+    object_like_frame_rate: float
+    persistent_video_rate: float
+    mean_foreground_area_ratio: float
     direction_confusion: list[list[int]]
     color_confusion: list[list[int]]
+    shape_confusion: list[list[int]]
     samples: int
     sampling_steps: int
     guidance_scale: float = 1.0
@@ -55,6 +63,32 @@ def _foreground_weights(frame: Tensor) -> Tensor:
     maximum = float(strength.max().item())
     threshold = max(0.10, maximum * 0.25)
     return torch.where(strength >= threshold, strength, torch.zeros_like(strength))
+
+
+def _foreground_fill_ratio(weights: Tensor) -> float:
+    mask = weights > 0
+    points = mask.nonzero(as_tuple=False)
+    if points.numel() == 0:
+        return 0.0
+    y_min = int(points[:, 0].min().item())
+    y_max = int(points[:, 0].max().item())
+    x_min = int(points[:, 1].min().item())
+    x_max = int(points[:, 1].max().item())
+    bbox_area = (y_max - y_min + 1) * (x_max - x_min + 1)
+    return float(mask.sum().item()) / bbox_area
+
+
+def _expected_shape_area(shape: str, size: int) -> int:
+    shape_size = controlled_motion_shape_size(size)
+    if shape == "square":
+        return shape_size * shape_size
+    if shape != "circle":
+        raise ValueError(f"unknown shape: {shape}")
+    coords = torch.arange(shape_size, dtype=torch.float32)
+    yy, xx = torch.meshgrid(coords, coords, indexing="ij")
+    center = (shape_size - 1) / 2.0
+    radius = max(1.0, shape_size / 2.0)
+    return int((((xx - center).square() + (yy - center).square()) <= radius**2).sum().item())
 
 
 def analyze_generated_video(video: Tensor) -> GeneratedVideoObservation:
@@ -98,6 +132,13 @@ def analyze_generated_video(video: Tensor) -> GeneratedVideoObservation:
     else:
         direction = "down" if dy >= 0 else "up"
 
+    fill_ratios = [_foreground_fill_ratio(weights) for weights in all_weights]
+    mean_fill_ratio = sum(fill_ratios) / len(fill_ratios)
+    square_fill = 1.0
+    circle_fill = _expected_shape_area("circle", height) / _expected_shape_area("square", height)
+    shape_boundary = (square_fill + circle_fill) / 2.0
+    shape = "square" if mean_fill_ratio >= shape_boundary else "circle"
+
     weight_volume = torch.stack(all_weights)
     maximum_weight = float(weight_volume.max().item())
     color_mask = weight_volume >= max(0.10, maximum_weight * 0.40)
@@ -116,7 +157,14 @@ def analyze_generated_video(video: Tensor) -> GeneratedVideoObservation:
             ).item()
         ),
     )
-    return GeneratedVideoObservation(direction=direction, color=color, mean_motion=mean_motion)
+    foreground_pixels = tuple(int((weights > 0).sum().item()) for weights in all_weights)
+    return GeneratedVideoObservation(
+        direction=direction,
+        color=color,
+        shape=shape,
+        mean_motion=mean_motion,
+        foreground_pixels=foreground_pixels,
+    )
 
 
 def evaluate_generated_videos(
@@ -135,10 +183,16 @@ def evaluate_generated_videos(
 
     direction_confusion = [[0 for _ in DIRECTIONS] for _ in DIRECTIONS]
     color_confusion = [[0 for _ in COLORS] for _ in COLORS]
+    shape_confusion = [[0 for _ in SHAPES] for _ in SHAPES]
     direction_correct = 0
     color_correct = 0
+    shape_correct = 0
     static = 0
     motion_total = 0.0
+    object_like_frames = 0
+    total_frames = 0
+    persistent_videos = 0
+    foreground_area_ratio_total = 0.0
 
     for index, control in enumerate(controls):
         observation = analyze_generated_video(videos[index])
@@ -146,21 +200,38 @@ def evaluate_generated_videos(
         observed_direction = DIRECTIONS.index(observation.direction)
         expected_color = COLORS.index(control.color)
         observed_color = COLORS.index(observation.color)
+        expected_shape = SHAPES.index(control.shape)
+        observed_shape = SHAPES.index(observation.shape)
         direction_confusion[expected_direction][observed_direction] += 1
         color_confusion[expected_color][observed_color] += 1
+        shape_confusion[expected_shape][observed_shape] += 1
         direction_correct += int(observation.direction == control.direction)
         color_correct += int(observation.color == control.color)
+        shape_correct += int(observation.shape == control.shape)
         static += int(observation.mean_motion <= static_motion_threshold)
         motion_total += observation.mean_motion
+
+        expected_area = _expected_shape_area(control.shape, int(videos.shape[-1]))
+        area_ratios = [pixels / expected_area for pixels in observation.foreground_pixels]
+        object_like = [0.5 <= ratio <= 4.0 for ratio in area_ratios]
+        object_like_frames += sum(object_like)
+        total_frames += len(object_like)
+        persistent_videos += int(sum(object_like) / len(object_like) >= 0.875)
+        foreground_area_ratio_total += sum(area_ratios) / len(area_ratios)
 
     count = len(controls)
     return M1GenerationMetrics(
         direction_accuracy=direction_correct / count,
         color_accuracy=color_correct / count,
+        shape_accuracy=shape_correct / count,
         mean_motion=motion_total / count,
         static_rate=static / count,
+        object_like_frame_rate=object_like_frames / total_frames,
+        persistent_video_rate=persistent_videos / count,
+        mean_foreground_area_ratio=foreground_area_ratio_total / count,
         direction_confusion=direction_confusion,
         color_confusion=color_confusion,
+        shape_confusion=shape_confusion,
         samples=count,
         sampling_steps=sampling_steps,
     )
