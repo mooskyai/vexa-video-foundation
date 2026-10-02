@@ -12,12 +12,31 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from vexa_video.config import ProjectConfig
-from vexa_video.data import COLORS, DIRECTIONS, SHAPES, StageBSyntheticDataset, SyntheticControl
+from vexa_video.data import (
+    COLORS,
+    DIRECTIONS,
+    SHAPES,
+    StageBSyntheticDataset,
+    SyntheticControl,
+    render_motion_sample,
+)
 from vexa_video.data.controlled_motion import controlled_motion_shape_size
 from vexa_video.diffusion import LinearNoiseSchedule
 from vexa_video.inference.sampler import guided_ddim_rollout, sample_video
 from vexa_video.models import ByteTokenizer, TinyVideoVAE, TransformerTextEncoder, VideoDiT
 from vexa_video.training.checkpoint import build_training_checkpoint
+from vexa_video.training.m1_research import (
+    M1ResearchSettings,
+    causal_latent_delta_loss,
+    constraint_rank_score,
+    gradient_cosine_matrix,
+    latent_svd_diagnostics,
+    latent_target_ranking_loss,
+    merge_primary_and_protected_gradients,
+    min_snr_epsilon_weights,
+    sinkhorn_causal_gate,
+    sinkhorn_shape_geometry_loss,
+)
 
 
 @dataclass(slots=True)
@@ -47,6 +66,22 @@ class StageBStepMetrics:
     full_rollout_direction_loss: float = 0.0
     full_rollout_color_loss: float = 0.0
     full_rollout_shape_loss: float = 0.0
+    causal_shape_loss: float = 0.0
+    latent_shape_rank_loss: float = 0.0
+    latent_shape_rank_margin: float = 0.0
+    sinkhorn_shape_loss: float = 0.0
+    sinkhorn_shape_gate: float = 0.0
+    latent_shape_delta_cosine: float = 0.0
+    latent_shape_delta_magnitude_ratio: float = 0.0
+    sinkhorn_shape_margin: float = 0.0
+    shape_gradient_cosine: float = 0.0
+    shape_gradient_projection_active: float = 0.0
+    grad_cos_diffusion_direction: float = 0.0
+    grad_cos_diffusion_color: float = 0.0
+    grad_cos_diffusion_shape: float = 0.0
+    grad_cos_direction_color: float = 0.0
+    grad_cos_direction_shape: float = 0.0
+    grad_cos_color_shape: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,6 +195,35 @@ def _sample_batch(
     return videos, captions
 
 
+def _sample_shape_counterfactual_batch(
+    dataset: StageBSyntheticDataset,
+    indices: list[int],
+    *,
+    device: torch.device,
+) -> tuple[Tensor, list[str]]:
+    paired_videos: list[Tensor] = []
+    paired_captions: list[str] = []
+    for index in indices:
+        sample = dataset.sample(index)
+        paired_shape = SHAPES[(SHAPES.index(sample.control.shape) + 1) % len(SHAPES)]
+        paired_control = SyntheticControl(
+            direction=sample.control.direction,
+            color=sample.control.color,
+            shape=paired_shape,
+            speed_bucket=sample.control.speed_bucket,
+        )
+        paired = render_motion_sample(
+            frames=dataset.frames,
+            size=dataset.size,
+            seed=sample.seed,
+            control=paired_control,
+            shape_size=controlled_motion_shape_size(dataset.size),
+        )
+        paired_videos.append(paired.video)
+        paired_captions.append(paired.caption)
+    return torch.stack(paired_videos).to(device), paired_captions
+
+
 def _random_indices(
     *,
     dataset_size: int,
@@ -187,6 +251,254 @@ def _caption_with_direction(caption: str, direction: str) -> str:
         if marker in caption:
             return caption.replace(marker, f" {direction} ", 1)
     raise ValueError(f"caption does not contain a direction term: {caption}")
+
+
+def _caption_with_control(caption: str, value: str, vocabulary: tuple[str, ...]) -> str:
+    if value not in vocabulary:
+        raise ValueError(f"unknown control value: {value}")
+    for word in vocabulary:
+        marker = f" {word} "
+        if marker in caption:
+            return caption.replace(marker, f" {value} ", 1)
+    raise ValueError(f"caption does not contain a control term from {vocabulary}: {caption}")
+
+
+def _soft_shape_template_loss(video: Tensor, captions: list[str], size: int) -> Tensor:
+    """Match decoded foreground geometry to the caption's square/circle template."""
+    if video.ndim != 5 or video.shape[1] != 3:
+        raise ValueError("video must have shape [B, 3, T, H, W]")
+    if video.shape[0] != len(captions):
+        raise ValueError("video/caption counts must match")
+
+    signal = ((video + 1.0) * 0.5).clamp(0.0, 1.0).amax(dim=1)
+    weights = signal.square()
+    _, frames, height, width = signal.shape
+    y_grid, x_grid = torch.meshgrid(
+        torch.arange(height, device=video.device, dtype=video.dtype),
+        torch.arange(width, device=video.device, dtype=video.dtype),
+        indexing="ij",
+    )
+    mass = weights.sum(dim=(2, 3)).clamp_min(1e-6)
+    center_x = (weights * x_grid.view(1, 1, height, width)).sum(dim=(2, 3)) / mass
+    center_y = (weights * y_grid.view(1, 1, height, width)).sum(dim=(2, 3)) / mass
+
+    shape_size = controlled_motion_shape_size(size)
+    half_extent = (shape_size - 1) / 2.0
+    center_x = (torch.floor(center_x.detach()) + 0.5).clamp(half_extent, (width - 1) - half_extent)
+    center_y = (torch.floor(center_y.detach()) + 0.5).clamp(half_extent, (height - 1) - half_extent)
+    dx = x_grid.view(1, 1, height, width) - center_x[:, :, None, None]
+    dy = y_grid.view(1, 1, height, width) - center_y[:, :, None, None]
+    square_template = ((dx.abs() <= half_extent) & (dy.abs() <= half_extent)).to(dtype=video.dtype)
+    radius = max(1.0, shape_size / 2.0)
+    circle_template = (dx.square() + dy.square() <= radius**2).to(dtype=video.dtype)
+
+    square_selector: list[float] = []
+    for caption in captions:
+        if " square " in caption:
+            square_selector.append(1.0)
+        elif " circle " in caption:
+            square_selector.append(0.0)
+        else:
+            raise ValueError(f"caption does not contain a shape term: {caption}")
+    selector = torch.tensor(square_selector, device=video.device, dtype=video.dtype).view(
+        -1, 1, 1, 1
+    )
+    target = selector * square_template + (1.0 - selector) * circle_template
+    target_area = target.sum(dim=(2, 3)).clamp_min(1.0)
+    frame_loss = (signal - target).square().sum(dim=(2, 3)) / target_area
+    if frame_loss.shape != (video.shape[0], frames):
+        raise RuntimeError("unexpected shape-template loss dimensions")
+    return frame_loss.mean()
+
+
+def _shape_square_selector(
+    captions: list[str], *, device: torch.device, dtype: torch.dtype
+) -> Tensor:
+    values: list[float] = []
+    for caption in captions:
+        if " square " in caption:
+            values.append(1.0)
+        elif " circle " in caption:
+            values.append(0.0)
+        else:
+            raise ValueError(f"caption does not contain a shape term: {caption}")
+    return torch.tensor(values, device=device, dtype=dtype)
+
+
+def _soft_shape_corner_occupancy(video: Tensor, size: int) -> Tensor:
+    """Return per-frame occupancy of pixels present only in the square template."""
+    if video.ndim != 5 or video.shape[1] != 3:
+        raise ValueError("video must have shape [B, 3, T, H, W]")
+
+    signal = ((video + 1.0) * 0.5).clamp(0.0, 1.0).amax(dim=1)
+    weights = signal.square()
+    _, _, height, width = signal.shape
+    y_grid, x_grid = torch.meshgrid(
+        torch.arange(height, device=video.device, dtype=video.dtype),
+        torch.arange(width, device=video.device, dtype=video.dtype),
+        indexing="ij",
+    )
+    mass = weights.sum(dim=(2, 3)).clamp_min(1e-6)
+    center_x = (weights * x_grid.view(1, 1, height, width)).sum(dim=(2, 3)) / mass
+    center_y = (weights * y_grid.view(1, 1, height, width)).sum(dim=(2, 3)) / mass
+
+    shape_size = controlled_motion_shape_size(size)
+    half_extent = (shape_size - 1) / 2.0
+    center_x = (torch.floor(center_x.detach()) + 0.5).clamp(half_extent, (width - 1) - half_extent)
+    center_y = (torch.floor(center_y.detach()) + 0.5).clamp(half_extent, (height - 1) - half_extent)
+    dx = x_grid.view(1, 1, height, width) - center_x[:, :, None, None]
+    dy = y_grid.view(1, 1, height, width) - center_y[:, :, None, None]
+    square_template = (dx.abs() <= half_extent) & (dy.abs() <= half_extent)
+    radius = max(1.0, shape_size / 2.0)
+    circle_template = dx.square() + dy.square() <= radius**2
+    corner_mask = (square_template & ~circle_template).to(dtype=video.dtype)
+    corner_count = corner_mask.sum(dim=(2, 3)).clamp_min(1.0)
+    return (signal * corner_mask).sum(dim=(2, 3)) / corner_count
+
+
+def _soft_shape_corner_loss(video: Tensor, captions: list[str], size: int) -> Tensor:
+    """Supervise only the pixels that distinguish square from circle."""
+    if video.shape[0] != len(captions):
+        raise ValueError("video/caption counts must match")
+    occupancy = _soft_shape_corner_occupancy(video, size)
+    square_target = _shape_square_selector(
+        captions, device=video.device, dtype=video.dtype
+    ).unsqueeze(1)
+    return F.mse_loss(occupancy, square_target.expand_as(occupancy))
+
+
+def _soft_shape_pair_margin_loss(
+    first_video: Tensor,
+    first_captions: list[str],
+    second_video: Tensor,
+    second_captions: list[str],
+    size: int,
+    *,
+    margin: float = 0.5,
+) -> Tensor:
+    """Force same-noise square/circle outputs to separate in corner occupancy."""
+    if first_video.shape != second_video.shape:
+        raise ValueError("paired shape videos must have identical shapes")
+    if first_video.shape[0] != len(first_captions) or second_video.shape[0] != len(second_captions):
+        raise ValueError("paired video/caption counts must match")
+    if margin <= 0.0:
+        raise ValueError("shape pair margin must be positive")
+
+    first_target = _shape_square_selector(
+        first_captions, device=first_video.device, dtype=first_video.dtype
+    )
+    second_target = _shape_square_selector(
+        second_captions, device=second_video.device, dtype=second_video.dtype
+    )
+    orientation = first_target - second_target
+    if not bool(orientation.abs().eq(1.0).all().item()):
+        raise ValueError("paired captions must contain opposite square/circle targets")
+
+    first_occupancy = _soft_shape_corner_occupancy(first_video, size).mean(dim=1)
+    second_occupancy = _soft_shape_corner_occupancy(second_video, size).mean(dim=1)
+    separation = orientation * (first_occupancy - second_occupancy)
+    return F.relu(margin - separation).mean()
+
+
+def _shape_fill_targets(
+    captions: list[str],
+    size: int,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Tensor:
+    """Return evaluator-aligned square/circle fill-ratio targets."""
+    shape_size = controlled_motion_shape_size(size)
+    coords = torch.arange(shape_size, device=device, dtype=dtype)
+    yy, xx = torch.meshgrid(coords, coords, indexing="ij")
+    center = (shape_size - 1) / 2.0
+    radius = max(1.0, shape_size / 2.0)
+    circle_area = ((xx - center).square() + (yy - center).square() <= radius**2).sum()
+    circle_fill = circle_area.to(dtype=dtype) / float(shape_size * shape_size)
+
+    values: list[Tensor] = []
+    for caption in captions:
+        if " square " in caption:
+            values.append(torch.ones((), device=device, dtype=dtype))
+        elif " circle " in caption:
+            values.append(circle_fill)
+        else:
+            raise ValueError(f"caption does not contain a shape term: {caption}")
+    return torch.stack(values)
+
+
+def _soft_evaluator_shape_fill(video: Tensor, size: int) -> Tensor:
+    """Approximate the frozen evaluator's fill ratio on the expected object box."""
+    if video.ndim != 5 or video.shape[1] != 3:
+        raise ValueError("video must have shape [B, 3, T, H, W]")
+
+    strength = (video + 1.0).abs().mean(dim=1)
+    _, _, height, width = strength.shape
+    y_grid, x_grid = torch.meshgrid(
+        torch.arange(height, device=video.device, dtype=video.dtype),
+        torch.arange(width, device=video.device, dtype=video.dtype),
+        indexing="ij",
+    )
+    center_weights = strength.square()
+    mass = center_weights.sum(dim=(2, 3)).clamp_min(1e-6)
+    center_x = (center_weights * x_grid.view(1, 1, height, width)).sum(dim=(2, 3)) / mass
+    center_y = (center_weights * y_grid.view(1, 1, height, width)).sum(dim=(2, 3)) / mass
+
+    shape_size = controlled_motion_shape_size(size)
+    half_extent = (shape_size - 1) / 2.0
+    center_x = (torch.floor(center_x.detach()) + 0.5).clamp(half_extent, (width - 1) - half_extent)
+    center_y = (torch.floor(center_y.detach()) + 0.5).clamp(half_extent, (height - 1) - half_extent)
+    dx = x_grid.view(1, 1, height, width) - center_x[:, :, None, None]
+    dy = y_grid.view(1, 1, height, width) - center_y[:, :, None, None]
+    expected_box = ((dx.abs() <= half_extent) & (dy.abs() <= half_extent)).to(dtype=video.dtype)
+
+    maximum = strength.amax(dim=(2, 3), keepdim=True)
+    threshold = torch.maximum(torch.full_like(maximum, 0.10), maximum * 0.25)
+    scale = (maximum - threshold).clamp_min(1e-4)
+    occupancy = ((strength - threshold) / scale).clamp(0.0, 1.0)
+    box_area = expected_box.sum(dim=(2, 3)).clamp_min(1.0)
+    return (occupancy * expected_box).sum(dim=(2, 3)) / box_area
+
+
+def _soft_evaluator_shape_fill_loss(video: Tensor, captions: list[str], size: int) -> Tensor:
+    """Match square/circle geometry using the evaluator's fill-ratio targets."""
+    if video.shape[0] != len(captions):
+        raise ValueError("video/caption counts must match")
+    fill = _soft_evaluator_shape_fill(video, size)
+    targets = _shape_fill_targets(captions, size, device=video.device, dtype=video.dtype).unsqueeze(
+        1
+    )
+    return F.mse_loss(fill, targets.expand_as(fill))
+
+
+def _soft_evaluator_shape_pair_margin_loss(
+    first_video: Tensor,
+    first_captions: list[str],
+    second_video: Tensor,
+    second_captions: list[str],
+    size: int,
+) -> Tensor:
+    """Require same-noise shape pairs to span the evaluator's target fill gap."""
+    if first_video.shape != second_video.shape:
+        raise ValueError("paired shape videos must have identical shapes")
+    if first_video.shape[0] != len(first_captions) or second_video.shape[0] != len(second_captions):
+        raise ValueError("paired video/caption counts must match")
+
+    first_targets = _shape_fill_targets(
+        first_captions, size, device=first_video.device, dtype=first_video.dtype
+    )
+    second_targets = _shape_fill_targets(
+        second_captions, size, device=second_video.device, dtype=second_video.dtype
+    )
+    target_gap = first_targets - second_targets
+    if not bool(target_gap.abs().gt(0.0).all().item()):
+        raise ValueError("paired captions must contain opposite square/circle targets")
+
+    first_fill = _soft_evaluator_shape_fill(first_video, size).mean(dim=1)
+    second_fill = _soft_evaluator_shape_fill(second_video, size).mean(dim=1)
+    separation = target_gap.sign() * (first_fill - second_fill)
+    normalized_separation = separation / target_gap.abs().clamp_min(1e-6)
+    return F.relu(1.0 - normalized_separation).mean()
 
 
 def _conditioning_predictions(
@@ -417,11 +729,22 @@ def _sampler_aligned_losses(
         return zero, zero, zero
 
     base_captions = captions[:batch]
-    rollout_captions = [
+    direction_captions = [
         _caption_with_direction(caption, direction)
         for caption in base_captions
         for direction in DIRECTIONS
     ]
+    color_captions = [
+        _caption_with_control(caption, color, COLORS)
+        for caption in base_captions
+        for color in COLORS
+    ]
+    shape_captions = [
+        _caption_with_control(caption, shape, SHAPES)
+        for caption in base_captions
+        for shape in SHAPES
+    ]
+    rollout_captions = [*direction_captions, *color_captions, *shape_captions]
     conditional_tokens = components.tokenizer.batch(
         rollout_captions,
         cfg.text.max_length,
@@ -440,7 +763,15 @@ def _sampler_aligned_losses(
         unconditional_tokens.input_ids,
         unconditional_tokens.attention_mask,
     )
-    rollout_noise = initial_noise[:batch].repeat_interleave(len(DIRECTIONS), dim=0)
+    base_noise = initial_noise[:batch]
+    rollout_noise = torch.cat(
+        (
+            base_noise.repeat_interleave(len(DIRECTIONS), dim=0),
+            base_noise.repeat_interleave(len(COLORS), dim=0),
+            base_noise.repeat_interleave(len(SHAPES), dim=0),
+        ),
+        dim=0,
+    )
     steps = sampling_steps if sampling_steps is not None else cfg.m1.rollout_steps
     rollout_latents = guided_ddim_rollout(
         latents=rollout_noise,
@@ -457,8 +788,14 @@ def _sampler_aligned_losses(
         guidance_scale=cfg.m1.guidance_scale,
     )
     rollout_video = components.vae.decode(rollout_latents)
-    rollout_motion, rollout_color = _soft_video_features(rollout_video)
-    rollout_shape = _soft_shape_score(rollout_video)
+    direction_count = batch * len(DIRECTIONS)
+    color_count = batch * len(COLORS)
+    direction_video = rollout_video[:direction_count]
+    color_video = rollout_video[direction_count : direction_count + color_count]
+    shape_video = rollout_video[direction_count + color_count :]
+
+    rollout_motion, _ = _soft_video_features(direction_video)
+    _, rollout_color = _soft_video_features(color_video)
     direction_targets = torch.tensor(
         [_DIRECTION_TARGETS[direction] for _ in base_captions for direction in DIRECTIONS],
         device=device,
@@ -467,20 +804,7 @@ def _sampler_aligned_losses(
     color_targets = torch.stack(
         [
             _caption_target(caption, _COLOR_TARGETS, device=device, dtype=clean_latents.dtype)
-            for caption in base_captions
-            for _ in DIRECTIONS
-        ]
-    )
-    shape_targets = torch.stack(
-        [
-            _shape_target(
-                caption,
-                cfg.data.height,
-                device=device,
-                dtype=rollout_video.dtype,
-            )
-            for caption in base_captions
-            for _ in DIRECTIONS
+            for caption in color_captions
         ]
     )
     motion_floor = cfg.m1.semantic_min_motion if minimum_motion is None else minimum_motion
@@ -490,7 +814,19 @@ def _sampler_aligned_losses(
         motion_floor,
     )
     color_loss = F.mse_loss(rollout_color, color_targets)
-    shape_loss = F.mse_loss(rollout_shape, shape_targets)
+    shape_loss = _soft_evaluator_shape_fill_loss(
+        shape_video,
+        shape_captions,
+        cfg.data.height,
+    )
+    paired_shape_video = shape_video.reshape(batch, len(SHAPES), *shape_video.shape[1:])
+    shape_loss = shape_loss + _soft_evaluator_shape_pair_margin_loss(
+        paired_shape_video[:, 0],
+        shape_captions[0 :: len(SHAPES)],
+        paired_shape_video[:, 1],
+        shape_captions[1 :: len(SHAPES)],
+        cfg.data.height,
+    )
     shape_loss = shape_loss + _soft_foreground_area_loss(
         rollout_video,
         rollout_captions,
@@ -549,10 +885,8 @@ def _semantic_conditioning_losses(
     decoded = components.vae.decode(predicted_clean)
     correct_video, color_video, direction_video, shape_video = decoded.chunk(4, dim=0)
     correct_motion, correct_color = _soft_video_features(correct_video)
-    correct_shape = _soft_shape_score(correct_video)
     _, counterfactual_color = _soft_video_features(color_video)
     counterfactual_motion, _ = _soft_video_features(direction_video)
-    counterfactual_shape = _soft_shape_score(shape_video)
 
     direction_target = torch.stack(
         [
@@ -578,18 +912,6 @@ def _semantic_conditioning_losses(
             for caption in color_captions
         ]
     )
-    shape_target = torch.stack(
-        [
-            _shape_target(caption, cfg.data.height, device=device, dtype=clean_latents.dtype)
-            for caption in captions
-        ]
-    )
-    shape_counterfactual_target = torch.stack(
-        [
-            _shape_target(caption, cfg.data.height, device=device, dtype=clean_latents.dtype)
-            for caption in shape_captions
-        ]
-    )
     direction_loss = 0.5 * (
         _motion_target_loss(correct_motion, direction_target, cfg.m1.semantic_min_motion)
         + _motion_target_loss(
@@ -601,8 +923,15 @@ def _semantic_conditioning_losses(
         + F.mse_loss(counterfactual_color, color_counterfactual_target)
     )
     shape_loss = 0.5 * (
-        F.mse_loss(correct_shape, shape_target)
-        + F.mse_loss(counterfactual_shape, shape_counterfactual_target)
+        _soft_evaluator_shape_fill_loss(correct_video, captions, cfg.data.height)
+        + _soft_evaluator_shape_fill_loss(shape_video, shape_captions, cfg.data.height)
+    )
+    shape_loss = shape_loss + _soft_evaluator_shape_pair_margin_loss(
+        correct_video,
+        captions,
+        shape_video,
+        shape_captions,
+        cfg.data.height,
     )
     shape_loss = shape_loss + 0.5 * (
         _soft_foreground_area_loss(correct_video, captions, cfg.data.height)
@@ -619,6 +948,125 @@ def _semantic_conditioning_losses(
     direction_loss = direction_loss + cfg.m1.rollout_direction_weight * rollout_direction_loss
     shape_loss = shape_loss + cfg.m1.rollout_shape_weight * rollout_shape_loss
     return direction_loss, color_loss, shape_loss
+
+
+def _causal_shape_research_losses(
+    *,
+    components: StageBComponents,
+    clean_latents: Tensor,
+    paired_latents: Tensor,
+    captions: list[str],
+    paired_captions: list[str],
+    cfg: ProjectConfig,
+    device: torch.device,
+    research: M1ResearchSettings,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    if clean_latents.shape != paired_latents.shape:
+        raise ValueError("causal shape latent pairs must have identical shapes")
+    if len(captions) != clean_latents.shape[0] or len(paired_captions) != len(captions):
+        raise ValueError("causal shape caption counts must match the latent batch")
+
+    batch = clean_latents.shape[0]
+    timestep_value = cfg.m1.semantic_timestep
+    timesteps = torch.full((batch,), timestep_value, device=device, dtype=torch.long)
+    common_clean = 0.5 * (clean_latents + paired_latents)
+    common_noise = torch.randn_like(common_clean)
+    noisy = components.schedule.add_noise(common_clean, common_noise, timesteps)
+    all_captions = [*captions, *paired_captions]
+    tokens = components.tokenizer.batch(all_captions, cfg.text.max_length, device=device)
+    text_tokens = components.text_encoder(tokens.input_ids, tokens.attention_mask)
+    predicted_noise = components.dit(
+        torch.cat((noisy, noisy), dim=0),
+        timesteps.repeat(2),
+        text_tokens,
+        tokens.attention_mask,
+    )
+    first_noise, second_noise = predicted_noise.chunk(2, dim=0)
+    predicted_first = components.schedule.predict_clean(noisy, first_noise, timestep_value)
+    predicted_second = components.schedule.predict_clean(noisy, second_noise, timestep_value)
+    causal_loss, delta_cosine, magnitude_ratio = causal_latent_delta_loss(
+        predicted_first,
+        predicted_second,
+        clean_latents,
+        paired_latents,
+    )
+    rank_loss, _, rank_margin = latent_target_ranking_loss(
+        predicted_first,
+        predicted_second,
+        clean_latents,
+        paired_latents,
+        margin=research.latent_rank_margin,
+    )
+    sinkhorn_gate = sinkhorn_causal_gate(
+        delta_cosine,
+        start=research.sinkhorn_gate_start,
+        full=research.sinkhorn_gate_full,
+    )
+
+    sinkhorn_loss = clean_latents.new_zeros(())
+    sinkhorn_margin = clean_latents.new_zeros(())
+    if float(sinkhorn_gate.item()) > 0.0 and research.sinkhorn_shape_weight > 0.0:
+        decoded = components.vae.decode(torch.cat((predicted_first, predicted_second), dim=0))
+        first_video, second_video = decoded.chunk(2, dim=0)
+        first_sinkhorn, _, first_margin = sinkhorn_shape_geometry_loss(
+            first_video,
+            captions,
+            size=cfg.data.height,
+            blur=research.sinkhorn_blur,
+            margin=research.sinkhorn_margin,
+        )
+        second_sinkhorn, _, second_margin = sinkhorn_shape_geometry_loss(
+            second_video,
+            paired_captions,
+            size=cfg.data.height,
+            blur=research.sinkhorn_blur,
+            margin=research.sinkhorn_margin,
+        )
+        sinkhorn_loss = 0.5 * (first_sinkhorn + second_sinkhorn)
+        sinkhorn_margin = 0.5 * (first_margin + second_margin)
+
+    total = (
+        research.causal_shape_weight * causal_loss
+        + research.latent_rank_weight * rank_loss
+        + research.sinkhorn_shape_weight * sinkhorn_gate * sinkhorn_loss
+    )
+    return (
+        total,
+        causal_loss,
+        rank_loss,
+        sinkhorn_loss,
+        delta_cosine,
+        magnitude_ratio,
+        rank_margin,
+        sinkhorn_margin,
+        sinkhorn_gate,
+    )
+
+
+def _shape_latent_svd_metrics(
+    *,
+    components: StageBComponents,
+    dataset: StageBSyntheticDataset,
+    research: M1ResearchSettings,
+    device: torch.device,
+) -> dict[str, float]:
+    sample_count = min(research.svd_samples, len(dataset))
+    indices = list(range(sample_count))
+    videos, captions = _sample_batch(dataset, indices, device=device)
+    paired_videos, _ = _sample_shape_counterfactual_batch(dataset, indices, device=device)
+    components.vae.eval()
+    with torch.no_grad():
+        first_latents = components.vae.encode(videos)
+        second_latents = components.vae.encode(paired_videos)
+    signs = torch.tensor(
+        [1.0 if " square " in caption else -1.0 for caption in captions],
+        device=device,
+        dtype=first_latents.dtype,
+    )
+    while signs.ndim < first_latents.ndim:
+        signs = signs.unsqueeze(-1)
+    square_minus_circle = signs * (first_latents - second_latents)
+    return latent_svd_diagnostics(square_minus_circle)
 
 
 def vae_warmup_step(
@@ -655,14 +1103,26 @@ def diffusion_train_step(
     optimizer: torch.optim.Optimizer,
     videos: Tensor,
     captions: list[str],
+    paired_videos: Tensor | None = None,
+    paired_captions: list[str] | None = None,
     cfg: ProjectConfig,
     device: torch.device,
+    research: M1ResearchSettings | None = None,
     run_full_rollout: bool = False,
+    diagnose_gradients: bool = False,
 ) -> StageBStepMetrics:
     components.text_encoder.train()
     components.dit.train()
     components.vae.eval()
     optimizer.zero_grad(set_to_none=True)
+    research_settings = research or M1ResearchSettings(
+        causal_shape_weight=0.0,
+        sinkhorn_shape_weight=0.0,
+        gradient_diagnostics=False,
+    )
+    research_enabled = (
+        research is not None and paired_videos is not None and paired_captions is not None
+    )
 
     with torch.no_grad():
         reconstruction, latents = components.vae(videos)
@@ -671,6 +1131,10 @@ def diffusion_train_step(
             videos,
             silhouette_weight=cfg.m1.vae_silhouette_weight,
         )
+        paired_latents: Tensor | None = None
+        if research_enabled:
+            assert paired_videos is not None
+            paired_latents = components.vae.encode(paired_videos)
     timesteps = _sample_training_timesteps(
         batch_size=videos.shape[0],
         timesteps=components.schedule.timesteps,
@@ -701,13 +1165,18 @@ def diffusion_train_step(
     color_gap = color_counterfactual_error - conditioned_error
     direction_gap = direction_counterfactual_error - conditioned_error
     shape_gap = shape_counterfactual_error - conditioned_error
-    contrast_loss = (
-        F.relu(cfg.m1.prompt_contrast_margin - color_gap).mean()
-        + F.relu(cfg.m1.prompt_contrast_margin - direction_gap).mean()
-        + F.relu(cfg.m1.prompt_contrast_margin - shape_gap).mean()
-    ) / 3.0
-    diffusion_loss = conditioned_error.mean()
-    unconditional_loss = unconditional_error.mean()
+    color_contrast_loss = F.relu(cfg.m1.prompt_contrast_margin - color_gap).mean()
+    direction_contrast_loss = F.relu(cfg.m1.prompt_contrast_margin - direction_gap).mean()
+    shape_contrast_loss = F.relu(cfg.m1.prompt_contrast_margin - shape_gap).mean()
+    contrast_loss = (color_contrast_loss + direction_contrast_loss + shape_contrast_loss) / 3.0
+    snr_weights = min_snr_epsilon_weights(
+        components.schedule,
+        timesteps,
+        gamma=research_settings.min_snr_gamma,
+        dtype=conditioned_error.dtype,
+    )
+    diffusion_loss = (conditioned_error * snr_weights).mean()
+    unconditional_loss = (unconditional_error * snr_weights).mean()
     counterfactual_loss = (
         color_counterfactual_error.mean()
         + direction_counterfactual_error.mean()
@@ -722,6 +1191,38 @@ def diffusion_train_step(
             device=device,
         )
     )
+    research_shape_loss = latents.new_zeros(())
+    causal_shape_loss = latents.new_zeros(())
+    latent_shape_rank_loss = latents.new_zeros(())
+    latent_shape_rank_margin = latents.new_zeros(())
+    sinkhorn_shape_loss = latents.new_zeros(())
+    sinkhorn_shape_gate = latents.new_zeros(())
+    latent_shape_delta_cosine = latents.new_zeros(())
+    latent_shape_delta_magnitude_ratio = latents.new_zeros(())
+    sinkhorn_shape_margin = latents.new_zeros(())
+    if research_enabled:
+        assert paired_latents is not None
+        assert paired_captions is not None
+        (
+            research_shape_loss,
+            causal_shape_loss,
+            latent_shape_rank_loss,
+            sinkhorn_shape_loss,
+            latent_shape_delta_cosine,
+            latent_shape_delta_magnitude_ratio,
+            latent_shape_rank_margin,
+            sinkhorn_shape_margin,
+            sinkhorn_shape_gate,
+        ) = _causal_shape_research_losses(
+            components=components,
+            clean_latents=latents,
+            paired_latents=paired_latents,
+            captions=captions,
+            paired_captions=paired_captions,
+            cfg=cfg,
+            device=device,
+            research=research_settings,
+        )
     full_rollout_direction_loss = latents.new_zeros(())
     full_rollout_color_loss = latents.new_zeros(())
     full_rollout_shape_loss = latents.new_zeros(())
@@ -740,19 +1241,57 @@ def diffusion_train_step(
             sampling_steps=cfg.m1.full_rollout_steps,
             minimum_motion=cfg.m1.full_rollout_min_motion,
         )
-    optimization_loss = (
+    primary_optimization_loss = (
         cfg.m1.diffusion_weight * diffusion_loss
         + cfg.m1.unconditional_loss_weight * unconditional_loss
-        + cfg.m1.prompt_contrast_weight * contrast_loss
+        + cfg.m1.prompt_contrast_weight * (color_contrast_loss + direction_contrast_loss) / 3.0
         + cfg.m1.semantic_direction_weight * semantic_direction_loss
         + cfg.m1.semantic_color_weight * semantic_color_loss
-        + cfg.m1.semantic_shape_weight * semantic_shape_loss
         + cfg.m1.full_rollout_direction_weight * full_rollout_direction_loss
         + cfg.m1.full_rollout_color_weight * full_rollout_color_loss
-        + cfg.m1.full_rollout_shape_weight * full_rollout_shape_loss
     )
-    torch.autograd.backward(optimization_loss)
+    protected_shape_loss = (
+        cfg.m1.prompt_contrast_weight * shape_contrast_loss / 3.0
+        + cfg.m1.semantic_shape_weight * semantic_shape_loss
+        + cfg.m1.full_rollout_shape_weight * full_rollout_shape_loss
+        + research_shape_loss
+    )
+    optimization_loss = primary_optimization_loss + protected_shape_loss
     trainable = [*components.text_encoder.parameters(), *components.dit.parameters()]
+    gradient_metrics: dict[str, float] = {}
+    if diagnose_gradients and research_settings.gradient_diagnostics:
+        diagnostic_parameters = trainable[-2:]
+        gradient_metrics = gradient_cosine_matrix(
+            {
+                "diffusion": cfg.m1.diffusion_weight * diffusion_loss,
+                "direction": cfg.m1.semantic_direction_weight * semantic_direction_loss,
+                "color": cfg.m1.semantic_color_weight * semantic_color_loss,
+                "shape": protected_shape_loss,
+            },
+            diagnostic_parameters,
+        )
+
+    shape_gradient_cosine = 0.0
+    shape_gradient_projection_active = False
+    if research_enabled and research_settings.shape_gradient_surgery:
+        primary_gradients = torch.autograd.grad(
+            primary_optimization_loss,
+            trainable,
+            retain_graph=True,
+            allow_unused=True,
+        )
+        protected_gradients = torch.autograd.grad(
+            protected_shape_loss,
+            trainable,
+            allow_unused=True,
+        )
+        merged_gradients, shape_gradient_cosine, shape_gradient_projection_active = (
+            merge_primary_and_protected_gradients(primary_gradients, protected_gradients)
+        )
+        for parameter, gradient in zip(trainable, merged_gradients, strict=True):
+            parameter.grad = gradient
+    else:
+        torch.autograd.backward(optimization_loss)
     grad_norm = torch.nn.utils.clip_grad_norm_(trainable, cfg.m1.grad_clip)
     optimizer.step()
 
@@ -781,6 +1320,24 @@ def diffusion_train_step(
         full_rollout_direction_loss=float(full_rollout_direction_loss.detach().item()),
         full_rollout_color_loss=float(full_rollout_color_loss.detach().item()),
         full_rollout_shape_loss=float(full_rollout_shape_loss.detach().item()),
+        causal_shape_loss=float(causal_shape_loss.detach().item()),
+        latent_shape_rank_loss=float(latent_shape_rank_loss.detach().item()),
+        latent_shape_rank_margin=float(latent_shape_rank_margin.detach().item()),
+        sinkhorn_shape_loss=float(sinkhorn_shape_loss.detach().item()),
+        sinkhorn_shape_gate=float(sinkhorn_shape_gate.detach().item()),
+        latent_shape_delta_cosine=float(latent_shape_delta_cosine.detach().item()),
+        latent_shape_delta_magnitude_ratio=float(
+            latent_shape_delta_magnitude_ratio.detach().item()
+        ),
+        sinkhorn_shape_margin=float(sinkhorn_shape_margin.detach().item()),
+        shape_gradient_cosine=shape_gradient_cosine,
+        shape_gradient_projection_active=float(shape_gradient_projection_active),
+        grad_cos_diffusion_direction=gradient_metrics.get("grad_cos_diffusion_direction", 0.0),
+        grad_cos_diffusion_color=gradient_metrics.get("grad_cos_diffusion_color", 0.0),
+        grad_cos_diffusion_shape=gradient_metrics.get("grad_cos_diffusion_shape", 0.0),
+        grad_cos_direction_color=gradient_metrics.get("grad_cos_direction_color", 0.0),
+        grad_cos_direction_shape=gradient_metrics.get("grad_cos_direction_shape", 0.0),
+        grad_cos_color_shape=gradient_metrics.get("grad_cos_color_shape", 0.0),
     )
 
 
@@ -1157,12 +1714,15 @@ def train_stage_b(
     steps: int | None = None,
     resume: str | Path | None = None,
     vae_only: bool = False,
+    research: M1ResearchSettings | None = None,
 ) -> StageBTrainResult:
     if cfg.data.height != cfg.data.width:
         raise ValueError("M1 Stage-B currently requires square video dimensions")
     target_steps = steps if steps is not None else cfg.m1.max_steps
     if target_steps <= 0:
         raise ValueError("steps must be positive")
+    research_settings = research or M1ResearchSettings.from_env()
+    research_settings.validate()
     output_dir = Path(run_dir)
     checkpoints_dir = output_dir / "checkpoints"
     checkpoints_dir.mkdir(parents=True, exist_ok=True)
@@ -1342,6 +1902,21 @@ def train_stage_b(
             "Inspect the reported direction/color/shape/persistence/foreground-area metrics."
         )
 
+    shape_svd_metrics = _shape_latent_svd_metrics(
+        components=components,
+        dataset=validation_dataset,
+        research=research_settings,
+        device=device,
+    )
+    vae_visual_metric_payload.update(shape_svd_metrics)
+    print(
+        "m1_stage_b shape_latent_svd "
+        f"top1={shape_svd_metrics['shape_svd_top1_energy']:.6f} "
+        f"top4={shape_svd_metrics['shape_svd_top4_energy']:.6f} "
+        f"top8={shape_svd_metrics['shape_svd_top8_energy']:.6f} "
+        f"effective_rank={shape_svd_metrics['shape_svd_effective_rank']:.6f}"
+    )
+
     if vae_only:
         _save_checkpoint(
             path=latest_path,
@@ -1381,14 +1956,23 @@ def train_stage_b(
             generator=data_generator,
         )
         videos, captions = _sample_batch(train_dataset, indices, device=device)
+        paired_videos, paired_captions = _sample_shape_counterfactual_batch(
+            train_dataset,
+            indices,
+            device=device,
+        )
         last_metrics = diffusion_train_step(
             components=components,
             optimizer=diffusion_optimizer,
             videos=videos,
             captions=captions,
+            paired_videos=paired_videos,
+            paired_captions=paired_captions,
             cfg=cfg,
             device=device,
+            research=research_settings,
             run_full_rollout=diffusion_step % cfg.m1.full_rollout_every == 0,
+            diagnose_gradients=diffusion_step % cfg.m1.checkpoint_every == 0,
         )
         if diffusion_step == 1 or diffusion_step % cfg.m1.log_every == 0:
             print(
@@ -1405,8 +1989,30 @@ def train_stage_b(
                 f"full_rollout_direction={last_metrics.full_rollout_direction_loss:.6f} "
                 f"full_rollout_color={last_metrics.full_rollout_color_loss:.6f} "
                 f"full_rollout_shape={last_metrics.full_rollout_shape_loss:.6f} "
+                f"causal_shape={last_metrics.causal_shape_loss:.6f} "
+                f"latent_rank={last_metrics.latent_shape_rank_loss:.6f} "
+                f"latent_rank_margin={last_metrics.latent_shape_rank_margin:.6f} "
+                f"sinkhorn_shape={last_metrics.sinkhorn_shape_loss:.6f} "
+                f"sinkhorn_gate={last_metrics.sinkhorn_shape_gate:.6f} "
+                f"latent_shape_cos={last_metrics.latent_shape_delta_cosine:.6f} "
+                f"latent_shape_ratio={last_metrics.latent_shape_delta_magnitude_ratio:.6f} "
+                f"sinkhorn_margin={last_metrics.sinkhorn_shape_margin:.6f} "
+                f"shape_grad_cos={last_metrics.shape_gradient_cosine:.6f} "
+                f"shape_grad_projected={last_metrics.shape_gradient_projection_active:.0f} "
                 f"total={last_metrics.total_loss:.6f} "
                 f"grad_norm={last_metrics.gradient_norm:.6f}"
+            )
+
+        if diffusion_step % cfg.m1.checkpoint_every == 0 and research_settings.gradient_diagnostics:
+            print(
+                "m1_stage_b gradient_cosines "
+                f"step={diffusion_step} "
+                f"diff_direction={last_metrics.grad_cos_diffusion_direction:.6f} "
+                f"diff_color={last_metrics.grad_cos_diffusion_color:.6f} "
+                f"diff_shape={last_metrics.grad_cos_diffusion_shape:.6f} "
+                f"direction_color={last_metrics.grad_cos_direction_color:.6f} "
+                f"direction_shape={last_metrics.grad_cos_direction_shape:.6f} "
+                f"color_shape={last_metrics.grad_cos_color_shape:.6f}"
             )
 
         should_validate = (
@@ -1512,15 +2118,18 @@ def train_stage_b(
                 + generated_persistent_penalty
                 + generated_area_penalty
             )
-            validation_score = (
+            constraint_violation = generated_direction_penalty + generated_other_penalty
+            validation_tie_break_score = (
                 cfg.m1.reconstruction_weight * validation_reconstruction
                 + cfg.m1.diffusion_weight * validation_diffusion
                 + cfg.m1.prompt_contrast_weight * conditioning_penalty
                 + cfg.m1.semantic_direction_weight * validation_semantic_direction
                 + cfg.m1.semantic_color_weight * validation_semantic_color
                 + cfg.m1.semantic_shape_weight * validation_semantic_shape
-                + cfg.m1.validation_generation_direction_weight * generated_direction_penalty
-                + cfg.m1.validation_generation_other_weight * generated_other_penalty
+            )
+            validation_score = constraint_rank_score(
+                constraint_violation,
+                validation_tie_break_score,
             )
             checkpoint_metrics = {
                 **asdict(last_metrics),
@@ -1550,7 +2159,10 @@ def train_stage_b(
                 "validation_generated_persistent_penalty": generated_persistent_penalty,
                 "validation_generated_area_penalty": generated_area_penalty,
                 "validation_generated_other_penalty": generated_other_penalty,
+                "validation_constraint_violation": constraint_violation,
+                "validation_tie_break_score": validation_tie_break_score,
                 "validation_score": validation_score,
+                **shape_svd_metrics,
                 "vae_visual_direction_accuracy": vae_direction,
                 "vae_visual_color_accuracy": vae_color,
                 "vae_visual_shape_accuracy": vae_shape,
@@ -1609,6 +2221,7 @@ def train_stage_b(
                 f"generated_object_like={validation_generated_object_like:.6f} "
                 f"generated_persistent={validation_generated_persistent:.6f} "
                 f"generated_area_ratio={validation_generated_area_ratio:.6f} "
+                f"constraint_violation={constraint_violation:.6f} "
                 f"score={validation_score:.6f}"
             )
 

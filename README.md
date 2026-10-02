@@ -230,6 +230,74 @@ and pass the VAE gate before starting corrected diffusion training. M2 remains b
 
 The first shape-aware diffusion run exposed an objective mismatch: generated direction/color converged, but shape stayed near chance while persistence collapsed and foreground area expanded to roughly four times the renderer target. The correction keeps caption-only shape conditioning and adds differentiable per-frame foreground-area supervision to decoded semantic predictions and short/full CFG-DDIM rollout shape losses. Start this corrected diffusion objective from the independently passing VAE-only checkpoint at `diffusion_step=0`; do not resume the failed shape-control diffusion checkpoints.
 
+The 1,200-step foreground-area probe corrected the expansion shortcut but exposed a remaining conditioning asymmetry: direction reached `0.843750` while color stayed at `0.250000` and shape at `0.500000`. Sampler-aligned training had enumerated direction captions only, so full-horizon color and shape losses never received same-noise color/shape counterfactual rollouts. The next correction rolls out independent direction, color, and shape caption families from shared initial noise. The VAE, frozen gates, evaluator, CFG-DDIM sampler, and caption-only denoiser interface remain unchanged.
+
+The 1,200-step attribute-symmetric probe validated the color correction: direction reached `1.000000` and color improved to `0.687500`, but shape remained `0.500000`. Geometry also regressed because foreground-area loss had moved from the full rollout batch to the smaller shape-only family, ending at object-like frame rate `0.753906`, persistence `0.312500`, and foreground-area ratio `2.391071`. The follow-up keeps same-noise attribute rollouts, restores area supervision across every direction/color/shape rollout, and adds an object-centered square/circle template loss aligned to the evaluator's foreground geometry.
+
+The 1,200-step shape-template probe restored foreground scale by the end (`0.767433` area ratio), but the legacy normalized corner-moment shape proxy remained in the optimization path. When generated foreground became sparse, its variance-product denominator approached zero: semantic shape loss spiked as high as `2300.089111` and the raw gradient norm reached `4567552.000000`. Those shape gradients dominated globally clipped updates, erasing the previous color gain and leaving the run at direction `0.531250`, color `0.250000`, and shape `0.500000`. The next correction removes the corner-moment proxy from semantic and sampler-aligned optimization while retaining the bounded object-centered template loss, foreground-area supervision, and same-noise direction/color/shape rollout families.
+
+The 1,200-step stable-shape probe confirmed the corner-moment removal fixed the numerical failure: foreground-area ratio ended at `0.804091`, object-like frame rate at `0.941406`, persistence at `0.937500`, and direction recovered to `0.812500`, but color reached only `0.343750` and shape remained `0.500000`. Whole-template MSE still permits an average silhouette because square and circle share most foreground pixels. The next correction supervises only the square-only corner pixels and adds a same-noise square-vs-circle occupancy margin, while the existing area objective remains responsible for object scale and persistence.
+
+The 1,200-step discriminative-corner probe remained stable and improved conditioning, reaching direction `0.906250` and color `0.468750` at step 1100 with foreground-area ratio `1.172894`, but generated shape stayed exactly `0.500000` throughout validation. The frozen evaluator classifies shape from foreground fill inside the detected bounding box; for the 8x8 curriculum its square/circle fills are `1.000000` and `0.812500`, with decision boundary `0.906250`. The next correction therefore optimizes a bounded differentiable approximation of that fill-ratio geometry and requires same-noise square/circle rollouts to span the evaluator's `0.187500` target gap. The VAE, caption-only control interface, sampler, area objective, and frozen gates remain unchanged.
+
+## M1 research-rescue training
+
+The evaluator-aligned fill probe confirmed that proxy loss reduction is not sufficient to make the denoiser use the shape word. At step 1100 it reached direction `1.000000`, color `0.500000`, motion `0.043313`, and static rate `0.062500`, while generated shape stayed exactly `0.500000`; the final step retained direction `0.968750` and color `0.500000` but shape remained at chance and foreground area regressed above the frozen range. M1 therefore stays open and M2 stays blocked.
+
+The first 300-step research-rescue probe localized the blocker before decoding. The frozen VAE remained healthy, but its square/circle latent difference was distributed (`top1=0.089188`, `top4=0.298075`, `top8=0.493130`, effective rank `25.746357`), so no low-rank shape projection is used. More importantly, `latent_shape_cos` stayed near zero (`0.027183` at step 300), `latent_shape_ratio` collapsed to `0.420006`, and generated shape remained exactly `0.500000`. The global diagnostics also measured genuine objective conflict at step 300: diffusion-vs-shape `-0.121657` and direction-vs-shape `-0.242229`.
+
+The next research-rescue objective keeps the passed VAE, caption-only denoiser interface, CFG-DDIM sampler, frozen evaluator, and all M1 thresholds unchanged. It adds seven targeted mechanisms:
+
+- same-seed square/circle counterfactual videos provide a causal latent target; both captions see the same noisy midpoint latent, and the predicted square-minus-circle latent displacement is matched to the frozen VAE's true displacement;
+- a normalized latent target-ranking loss requires each caption-conditioned prediction to be closer to its own frozen-VAE target than to the square/circle counterfactual, directly penalizing midpoint/collapsed solutions;
+- shape-protected gradient surgery computes primary and shape gradients over the full trainable text/DiT path and projects only the primary component that has negative global dot product with the protected shape gradient; aligned primary updates are left untouched;
+- GeomLoss Sinkhorn divergence compares centered `8x8` decoded foreground measures with exact square/circle measures, but its gradient is causally gated off while latent shape cosine is below `0.10`, ramps between `0.10` and `0.30`, and reaches full weight at `0.30`;
+- Min-SNR-gamma weighting rebalances the ordinary epsilon-prediction objective across diffusion timesteps;
+- frozen-VAE latent SVD and checkpoint-step task-gradient cosines remain diagnostics only;
+- checkpoint selection is feasibility-first: normalized violations of every frozen generated-video gate dominate the ordinary validation losses, which are used only as a tie-breaker.
+
+The research controls default to `causal_shape_weight=1.0`, `latent_rank_weight=1.0`, `latent_rank_margin=0.25`, `sinkhorn_shape_weight=0.5`, causal Sinkhorn gate `0.10 -> 0.30`, and `min_snr_gamma=5.0`. They can be overridden without changing the frozen config or gates:
+
+```powershell
+$env:VEXA_M1_CAUSAL_SHAPE_WEIGHT = "1.0"
+$env:VEXA_M1_LATENT_RANK_WEIGHT = "1.0"
+$env:VEXA_M1_LATENT_RANK_MARGIN = "0.25"
+$env:VEXA_M1_SINKHORN_SHAPE_WEIGHT = "0.5"
+$env:VEXA_M1_SINKHORN_BLUR = "0.12"
+$env:VEXA_M1_SINKHORN_MARGIN = "0.02"
+$env:VEXA_M1_SINKHORN_GATE_START = "0.10"
+$env:VEXA_M1_SINKHORN_GATE_FULL = "0.30"
+$env:VEXA_M1_SHAPE_GRADIENT_SURGERY = "1"
+$env:VEXA_M1_MIN_SNR_GAMMA = "5.0"
+```
+
+Run one controlled 300-step rescue probe from the independently passing VAE-only checkpoint:
+
+```powershell
+uv run vexa-video train `
+  --config configs/tiny.toml `
+  --run-dir runs/m1-research-probe `
+  --resume runs/synthetic-motion-shape-footprint/checkpoints/latest.pt `
+  --steps 300 `
+  --cuda
+```
+
+Do not extend a rescue probe past 300 steps before reviewing `latent_rank`, `latent_rank_margin`, `shape_grad_cos`, `shape_grad_projected`, `sinkhorn_gate`, `latent_shape_cos`, `latent_shape_ratio`, generated shape, and the frozen gate violations.
+
+For a bounded hyperparameter search, Optuna runs independent 300-step trials from the same VAE-ready checkpoint and minimizes the feasibility-first checkpoint score:
+
+```powershell
+uv run python scripts/m1_optuna.py `
+  --config configs/tiny.toml `
+  --resume runs/synthetic-motion-shape-footprint/checkpoints/latest.pt `
+  --run-dir runs/m1-research-search `
+  --trials 8 `
+  --steps 300 `
+  --cuda
+```
+
+`geomloss==0.3.1` is the only new research runtime dependency used by this path; Optuna is a development dependency. Kornia, MONAI, LibMTL, and TorchOpt are intentionally not required.
+
 ## Development checks
 
 ```powershell

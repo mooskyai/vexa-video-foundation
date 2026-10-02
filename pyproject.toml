@@ -13,6 +13,11 @@ dependencies = [
 [project.scripts]
 vexa-video = "vexa_video.cli:main"
 
+[project.optional-dependencies]
+research = [
+    "geomloss==0.3.1",
+]
+
 
 # ---------------------------------------------------------------------------
 # uv package sources
@@ -34,6 +39,7 @@ explicit = true
 [dependency-groups]
 dev = [
     "mypy>=1.18.0",
+    "optuna>=5.0.0",
     "pytest>=8.4.0",
     "pytest-cov>=6.2.0",
     "ruff>=0.13.0",
