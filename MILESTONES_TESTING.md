@@ -382,3 +382,27 @@ as evidence of representational alignment. The next read-only diagnostic therefo
 
 No new training correction is allowed until these measurements distinguish a misdirected condition
 vector from reverse-dynamics amplification and spatial/evaluator misalignment.
+
+### M1 diagnostic interpretation requirements
+
+The [2026-10-02 audit](docs/experiments/m1-conditioning-analysis-20261002.md) qualifies
+the earlier diagnostic gates without changing any acceptance threshold. Before another
+training correction is selected, its evidence must:
+
+- measure the pool and attention conditioning actually consumed after normalization,
+  alongside raw text-span metrics;
+- retain position/motion/background drift and compare boundary effects in a common
+  spatial frame; unrelated renderer-location targets cannot validate generated-path binding;
+- separate analytic DDIM transport from learned state feedback, and report epsilon,
+  predicted-clean response, and transition forcing separately;
+- decode predicted-clean estimates with the frozen object-validity, persistence, and
+  area measurements, rather than inferring clean shape from noisy intermediate states;
+- include exact t=500, empirical latent power, multiple positions/noise seeds, signed
+  alignment, and appropriately calibrated context-aware statistics;
+- distinguish terminal-LayerNorm task-gradient diagnostics from whole-model surgery,
+  and raw-gradient projection from the actual AdamW update.
+
+The current scripts do not yet provide all these controls. No correction is selected
+by the audit. Checkpoint-free controls establish metric limitations; they do not replace
+learned-checkpoint measurements or close M1. The 64-video TEST/50-step/CFG=3 acceptance
+protocol, frozen evaluator, all visual/control gates, and manual MP4 validation stand.

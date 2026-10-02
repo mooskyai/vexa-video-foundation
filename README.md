@@ -395,3 +395,18 @@ uv run python scripts/m1_shape_dynamics_decomposition.py `
 
 This tool performs no optimizer step and does not modify the checkpoint, model architecture, VAE,
 CFG-DDIM sampler, evaluator, or frozen M1 gates. No additional package is required.
+
+## M1 conditioning analysis before another correction
+
+The [2026-10-02 source and math audit](docs/experiments/m1-conditioning-analysis-20261002.md)
+records the exact clean `fb3972d` baseline and checkpoint-free controls. Raw text-span
+separation can disappear in the consumed conditioning, generated-path latent alignment
+is confounded by renderer/generated object positions, and state-feedback gain includes
+analytic DDIM transport. The paired training targets themselves remain registered.
+
+Treat the existing decomposition as an algebraic diagnostic, with those interpretation
+limits. Before it selects a training correction, measure actual consumed text branches,
+registered boundary effects, predicted-clean geometry with object validity, and model
+feedback separately from transport. Include exact training timestep 500 and empirical
+latent signal power. The deleted learned checkpoint has not been re-evaluated. This
+audit changes documentation only; M1 remains open and M2 remains blocked.

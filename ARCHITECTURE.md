@@ -283,3 +283,14 @@ This does not complete M1. Generated-video quality remains the gate, and M2 rema
 ### Stage-B-v5 full-horizon preservation
 
 The v4 validation sweep established that caption-controlled direction is correct through roughly eight DDIM steps but is overwritten by later denoising, while color improves at longer horizons. v5 therefore keeps the shared inference/training CFG-DDIM helper, adds a periodic 50-step differentiable direction objective, and uses fixed validation-split 50-step generated metrics in checkpoint selection. This changes training and model selection only; the public 50-step inference protocol and frozen M1 thresholds remain unchanged.
+
+### M1 conditioning audit
+
+The [2026-10-02 audit](docs/experiments/m1-conditioning-analysis-20261002.md) documents
+the current projected text pool and tied key/value token attention before and after
+the two-block DiT, including normalization, positional endpoint aliases, and the
+distinction between conditional forcing and analytic DDIM transport. It records
+checkpoint-free counterexamples and diagnostic requirements; it introduces no model
+or training change. Per-block learned attention, adaLN, timestep-band supervision,
+and object-frame constraints remain conditional candidates pending matched learned
+response evidence. M1 remains open and M2 remains blocked.
