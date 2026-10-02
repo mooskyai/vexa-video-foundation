@@ -354,3 +354,31 @@ The DiT keeps text as the only semantic control but replaces per-token normaliza
 - leave the VAE, frozen evaluator, 50-step acceptance protocol, CFG guidance, and generation gates unchanged.
 
 For the next 300-step probe, inspect `text_shape`, `text_shape_cos`, `text_shape_span_delta`, `text_shape_global_ratio`, `latent_shape_cos`, `latent_shape_ratio`, `shape_grad_projected`, and `generated_shape` together. Do not extend the probe until the projected text separation improves and latent shape cosine shows a sustained response.
+
+### M1 causal-response diagnostic gate
+
+The text-conditioning probe separated the projected square/circle word spans but did not produce a
+sustained causal latent direction. Before any further training correction, run the read-only causal
+shape scan over all 50 frozen sampler timesteps. Record local predicted-clean response cosine and
+gain, linear CKA against the frozen-VAE shape-response subspace, response SVD/effective rank, and
+the step-by-step CFG-DDIM square/circle trajectory divergence. This diagnostic changes no model
+weights and introduces no new runtime dependency. A subsequent correction is allowed only after the
+scan localizes the failure to one of: absent conditioning response, timestep-localized response,
+subspace misalignment, or trajectory-level cancellation.
+
+### M1 state-vs-condition decomposition gate
+
+The first causal-response scan is not sufficient to authorize another training correction. With 16
+samples versus thousands of latent features, standard biased CKA must be calibrated before it is used
+as evidence of representational alignment. The next read-only diagnostic therefore requires:
+
+- permutation-calibrated linear CKA at every frozen sampler timestep;
+- an exact symmetric two-factor decomposition of each reverse transition into direct condition forcing
+  and state-feedback amplification;
+- target-parallel gain, target-orthogonal response, and aligned-energy fraction for the condition term;
+- state-feedback gain relative to the current square/circle trajectory separation;
+- decoded frozen-evaluator square/circle accuracy and signed fill-gap checkpoints through the 50-step
+  reverse trajectory.
+
+No new training correction is allowed until these measurements distinguish a misdirected condition
+vector from reverse-dynamics amplification and spatial/evaluator misalignment.

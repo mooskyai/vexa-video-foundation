@@ -304,6 +304,30 @@ uv run python scripts/m1_optuna.py `
 
 `geomloss==0.3.1` is the only new research runtime dependency used by this path; Optuna is a development dependency. Kornia, MONAI, LibMTL, and TorchOpt are intentionally not required.
 
+## M1 causal shape diagnostics
+
+Before another M1 correction, run the read-only square/circle causal scan against an existing
+checkpoint. The scan does not update weights or alter the VAE, sampler, evaluator, or frozen gates.
+It measures the caption intervention at every one of the 50 sampler timesteps and records:
+
+- predicted-clean square/circle delta cosine against the frozen-VAE target delta;
+- counterfactual magnitude gain;
+- linear centered-kernel alignment (CKA) between predicted and target shape-response subspaces;
+- SVD top-1/top-4 response energy and effective rank;
+- square/circle latent-trajectory divergence and per-step amplification through CFG-DDIM.
+
+```powershell
+uv run python scripts/m1_shape_causal_scan.py `
+  --config configs/tiny.toml `
+  --checkpoint runs/m1-text-conditioning-probe/checkpoints/best.pt `
+  --samples 16 `
+  --output runs/m1-text-conditioning-probe/shape-causal-scan.json `
+  --cuda
+```
+
+Do not change training objectives again until this scan identifies whether shape influence is absent
+throughout denoising, localized to a timestep band, or created early and destroyed later.
+
 ## Development checks
 
 ```powershell
@@ -348,3 +372,26 @@ The final roadmap targets:
 - efficient local inference variants distilled from our own trained models.
 
 Those are multi-year/frontier-scale research goals unless significant compute and data resources are available. The repository is structured so early milestones remain useful on a single development GPU while later milestones can move to distributed training.
+
+### M1 state-vs-condition dynamics decomposition
+
+The first causal scan showed that square/circle prompts create a large trajectory separation, but the
+standard 16-sample linear CKA statistic is not trusted as evidence of latent alignment because the
+comparison operates in a low-sample, high-dimensional regime. Before another training correction,
+run the read-only dynamics decomposition. It calibrates CKA against row permutations of the actual
+response matrices, decomposes each DDIM transition exactly into condition forcing and state-feedback
+terms, splits the condition response into target-parallel and target-orthogonal components, and decodes
+selected reverse steps with the frozen square/circle evaluator geometry.
+
+```powershell
+uv run python scripts/m1_shape_dynamics_decomposition.py `
+  --config configs/tiny.toml `
+  --checkpoint runs/m1-text-conditioning-probe/checkpoints/best.pt `
+  --samples 16 `
+  --permutations 256 `
+  --output runs/m1-text-conditioning-probe/shape-dynamics-decomposition.json `
+  --cuda
+```
+
+This tool performs no optimizer step and does not modify the checkpoint, model architecture, VAE,
+CFG-DDIM sampler, evaluator, or frozen M1 gates. No additional package is required.
