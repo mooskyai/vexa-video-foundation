@@ -21,6 +21,10 @@ class M1ResearchSettings:
     causal_shape_weight: float = 1.0
     latent_rank_weight: float = 1.0
     latent_rank_margin: float = 0.25
+    text_shape_weight: float = 1.0
+    text_shape_max_cosine: float = 0.25
+    text_shape_min_span_delta: float = 0.35
+    text_shape_min_global_ratio: float = 0.15
     sinkhorn_shape_weight: float = 0.5
     sinkhorn_blur: float = 0.12
     sinkhorn_margin: float = 0.02
@@ -38,6 +42,14 @@ class M1ResearchSettings:
             raise ValueError("latent_rank_weight must be non-negative")
         if self.latent_rank_margin < 0.0:
             raise ValueError("latent_rank_margin must be non-negative")
+        if self.text_shape_weight < 0.0:
+            raise ValueError("text_shape_weight must be non-negative")
+        if not -1.0 <= self.text_shape_max_cosine <= 1.0:
+            raise ValueError("text_shape_max_cosine must be in [-1, 1]")
+        if self.text_shape_min_span_delta < 0.0:
+            raise ValueError("text_shape_min_span_delta must be non-negative")
+        if self.text_shape_min_global_ratio < 0.0:
+            raise ValueError("text_shape_min_global_ratio must be non-negative")
         if self.sinkhorn_shape_weight < 0.0:
             raise ValueError("sinkhorn_shape_weight must be non-negative")
         if self.sinkhorn_blur <= 0.0:
@@ -57,6 +69,10 @@ class M1ResearchSettings:
             causal_shape_weight=_env_float("VEXA_M1_CAUSAL_SHAPE_WEIGHT", 1.0),
             latent_rank_weight=_env_float("VEXA_M1_LATENT_RANK_WEIGHT", 1.0),
             latent_rank_margin=_env_float("VEXA_M1_LATENT_RANK_MARGIN", 0.25),
+            text_shape_weight=_env_float("VEXA_M1_TEXT_SHAPE_WEIGHT", 1.0),
+            text_shape_max_cosine=_env_float("VEXA_M1_TEXT_SHAPE_MAX_COSINE", 0.25),
+            text_shape_min_span_delta=_env_float("VEXA_M1_TEXT_SHAPE_MIN_SPAN_DELTA", 0.35),
+            text_shape_min_global_ratio=_env_float("VEXA_M1_TEXT_SHAPE_MIN_GLOBAL_RATIO", 0.15),
             sinkhorn_shape_weight=_env_float("VEXA_M1_SINKHORN_SHAPE_WEIGHT", 0.5),
             sinkhorn_blur=_env_float("VEXA_M1_SINKHORN_BLUR", 0.12),
             sinkhorn_margin=_env_float("VEXA_M1_SINKHORN_MARGIN", 0.02),
@@ -155,6 +171,97 @@ def latent_target_ranking_loss(
     ranking = F.relu(margin + correct - wrong)
     loss = ranking.mean() + 0.25 * correct.mean()
     return loss, correct.mean(), (wrong - correct).mean()
+
+
+def _shape_word_mask(
+    captions: list[str],
+    *,
+    sequence_length: int,
+    device: torch.device,
+) -> Tensor:
+    mask = torch.zeros((len(captions), sequence_length), dtype=torch.bool, device=device)
+    for row, caption in enumerate(captions):
+        encoded = caption.encode("utf-8")
+        matches = [word for word in (b"square", b"circle") if word in encoded]
+        if len(matches) != 1:
+            raise ValueError(f"caption must contain exactly one shape word: {caption}")
+        word = matches[0]
+        start = encoded.index(word) + 1  # BOS occupies token position zero.
+        stop = start + len(word)
+        if stop > sequence_length:
+            raise ValueError("shape word is truncated by the configured text sequence length")
+        mask[row, start:stop] = True
+    return mask
+
+
+def _masked_mean(tokens: Tensor, mask: Tensor) -> Tensor:
+    weights = mask.to(dtype=tokens.dtype).unsqueeze(-1)
+    denominator = weights.sum(dim=1).clamp_min(1.0)
+    return (tokens * weights).sum(dim=1) / denominator
+
+
+def shape_text_separation_loss(
+    first_tokens: Tensor,
+    second_tokens: Tensor,
+    first_mask: Tensor,
+    second_mask: Tensor,
+    first_captions: list[str],
+    second_captions: list[str],
+    *,
+    max_cosine: float,
+    min_span_delta: float,
+    min_global_ratio: float,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Keep the square/circle word span separable after the DiT text projection."""
+    if first_tokens.shape != second_tokens.shape:
+        raise ValueError("paired projected text tensors must have identical shapes")
+    if first_mask.shape != second_mask.shape or first_mask.shape != first_tokens.shape[:2]:
+        raise ValueError("paired text masks must match projected text token shapes")
+    if len(first_captions) != first_tokens.shape[0] or len(second_captions) != len(first_captions):
+        raise ValueError("paired caption counts must match projected text batches")
+    if not -1.0 <= max_cosine <= 1.0:
+        raise ValueError("max_cosine must be in [-1, 1]")
+    if min_span_delta < 0.0 or min_global_ratio < 0.0:
+        raise ValueError("text separation thresholds must be non-negative")
+
+    first_shape_mask = _shape_word_mask(
+        first_captions,
+        sequence_length=first_tokens.shape[1],
+        device=first_tokens.device,
+    )
+    second_shape_mask = _shape_word_mask(
+        second_captions,
+        sequence_length=second_tokens.shape[1],
+        device=second_tokens.device,
+    )
+    first_span = _masked_mean(first_tokens, first_shape_mask)
+    second_span = _masked_mean(second_tokens, second_shape_mask)
+    span_cosine = F.cosine_similarity(first_span, second_span, dim=1, eps=1e-8)
+    span_delta = torch.linalg.vector_norm(first_span - second_span, dim=1)
+    span_scale = (
+        0.5
+        * (
+            torch.linalg.vector_norm(first_span, dim=1)
+            + torch.linalg.vector_norm(second_span, dim=1)
+        )
+    ).clamp_min(1e-6)
+    relative_span_delta = span_delta / span_scale
+
+    first_global = _masked_mean(first_tokens, first_mask)
+    second_global = _masked_mean(second_tokens, second_mask)
+    global_delta = torch.linalg.vector_norm(first_global - second_global, dim=1)
+    global_ratio = global_delta / span_delta.clamp_min(1e-6)
+
+    cosine_penalty = F.relu(span_cosine - max_cosine)
+    span_penalty = F.relu(min_span_delta - relative_span_delta)
+    global_penalty = F.relu(min_global_ratio - global_ratio)
+    loss = (cosine_penalty + span_penalty + global_penalty).mean()
+    return (
+        loss,
+        span_cosine.mean(),
+        relative_span_delta.mean(),
+        global_ratio.mean(),
+    )
 
 
 def sinkhorn_causal_gate(

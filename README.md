@@ -262,6 +262,10 @@ The research controls default to `causal_shape_weight=1.0`, `latent_rank_weight=
 $env:VEXA_M1_CAUSAL_SHAPE_WEIGHT = "1.0"
 $env:VEXA_M1_LATENT_RANK_WEIGHT = "1.0"
 $env:VEXA_M1_LATENT_RANK_MARGIN = "0.25"
+$env:VEXA_M1_TEXT_SHAPE_WEIGHT = "1.0"
+$env:VEXA_M1_TEXT_SHAPE_MAX_COSINE = "0.25"
+$env:VEXA_M1_TEXT_SHAPE_MIN_SPAN_DELTA = "0.35"
+$env:VEXA_M1_TEXT_SHAPE_MIN_GLOBAL_RATIO = "0.15"
 $env:VEXA_M1_SINKHORN_SHAPE_WEIGHT = "0.5"
 $env:VEXA_M1_SINKHORN_BLUR = "0.12"
 $env:VEXA_M1_SINKHORN_MARGIN = "0.02"
@@ -270,6 +274,8 @@ $env:VEXA_M1_SINKHORN_GATE_FULL = "0.30"
 $env:VEXA_M1_SHAPE_GRADIENT_SURGERY = "1"
 $env:VEXA_M1_MIN_SNR_GAMMA = "5.0"
 ```
+
+The first conflict-surgery probe confirmed that gradient projection activates, but the shape word still fails to create a causal latent direction: latent shape cosine stayed below `0.10` and generated shape remained at chance. The current rescue path therefore strengthens the text-conditioning bottleneck itself. The DiT now uses projection-driven cross-attention and importance-weighted text pooling, while a protected square/circle word-span objective keeps the projected shape tokens separated and prevents whole-caption pooling from erasing the counterfactual difference. Conditioning remains text-only; no structured shape ID is passed to the denoiser.
 
 Run one controlled 300-step rescue probe from the independently passing VAE-only checkpoint:
 

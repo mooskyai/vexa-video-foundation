@@ -58,22 +58,41 @@ def spatiotemporal_position_embedding(
 
 
 def token_text_attention(video_tokens: Tensor, text_tokens: Tensor, text_mask: Tensor) -> Tensor:
-    """Parameter-free token attention using the existing learned text projection space."""
+    """Projection-driven cross-attention over text tokens without a separate QKV module."""
     if video_tokens.ndim != 3 or text_tokens.ndim != 3:
         raise ValueError("video_tokens and text_tokens must be rank-3 tensors")
     if text_mask.shape != text_tokens.shape[:2]:
         raise ValueError("text_mask must have shape [B, L]")
     if video_tokens.shape[0] != text_tokens.shape[0]:
         raise ValueError("video/text batch sizes must match")
+    if video_tokens.shape[-1] != text_tokens.shape[-1]:
+        raise ValueError("video/text feature dimensions must match")
     if not bool(text_mask.any(dim=1).all().item()):
         raise ValueError("every text sequence must contain at least one unmasked token")
 
-    query = F.normalize(video_tokens, dim=-1)
-    key = F.normalize(text_tokens, dim=-1)
-    scores = torch.matmul(query, key.transpose(1, 2)) * 4.0
+    scale = 1.0 / math.sqrt(max(video_tokens.shape[-1], 1))
+    scores = torch.matmul(video_tokens, text_tokens.transpose(1, 2)) * scale
     scores = scores.masked_fill(~text_mask.unsqueeze(1), torch.finfo(scores.dtype).min)
     weights = torch.softmax(scores, dim=-1)
-    return torch.matmul(weights, text_tokens)
+    attended = torch.matmul(weights, text_tokens)
+    return F.layer_norm(attended, (attended.shape[-1],))
+
+
+def importance_weighted_text_pool(text_tokens: Tensor, text_mask: Tensor) -> Tensor:
+    """Pool text while letting the learned projection amplify informative tokens."""
+    if text_tokens.ndim != 3:
+        raise ValueError("text_tokens must have shape [B, L, D]")
+    if text_mask.shape != text_tokens.shape[:2]:
+        raise ValueError("text_mask must have shape [B, L]")
+    if not bool(text_mask.any(dim=1).all().item()):
+        raise ValueError("every text sequence must contain at least one unmasked token")
+
+    energy = text_tokens.square().mean(dim=-1).sqrt()
+    scores = energy / math.sqrt(max(text_tokens.shape[-1], 1))
+    scores = scores.masked_fill(~text_mask, torch.finfo(scores.dtype).min)
+    weights = torch.softmax(scores, dim=-1)
+    pooled = (weights.unsqueeze(-1) * text_tokens).sum(dim=1)
+    return F.layer_norm(pooled, (pooled.shape[-1],))
 
 
 class VideoDiT(nn.Module):
@@ -145,14 +164,8 @@ class VideoDiT(nn.Module):
         )
 
         time_cond = self.time_mlp(timestep_embedding(timesteps, tokens.shape[-1])).unsqueeze(1)
-        projected_text = F.layer_norm(
-            self.text_proj(text_tokens),
-            (tokens.shape[-1],),
-        )
-        mask = text_mask.to(dtype=projected_text.dtype).unsqueeze(-1)
-        denom = mask.sum(dim=1).clamp_min(1.0)
-        pooled_text = (projected_text * mask).sum(dim=1) / denom
-        text_cond = pooled_text.unsqueeze(1)
+        projected_text = self.text_proj(text_tokens)
+        text_cond = importance_weighted_text_pool(projected_text, text_mask).unsqueeze(1)
         token_cond = token_text_attention(tokens, projected_text, text_mask)
         tokens = tokens + positions + time_cond + text_cond + token_cond
         tokens = self.blocks(tokens)

@@ -34,6 +34,7 @@ from vexa_video.training.m1_research import (
     latent_target_ranking_loss,
     merge_primary_and_protected_gradients,
     min_snr_epsilon_weights,
+    shape_text_separation_loss,
     sinkhorn_causal_gate,
     sinkhorn_shape_geometry_loss,
 )
@@ -69,6 +70,10 @@ class StageBStepMetrics:
     causal_shape_loss: float = 0.0
     latent_shape_rank_loss: float = 0.0
     latent_shape_rank_margin: float = 0.0
+    text_shape_loss: float = 0.0
+    text_shape_cosine: float = 0.0
+    text_shape_span_delta: float = 0.0
+    text_shape_global_ratio: float = 0.0
     sinkhorn_shape_loss: float = 0.0
     sinkhorn_shape_gate: float = 0.0
     latent_shape_delta_cosine: float = 0.0
@@ -960,7 +965,21 @@ def _causal_shape_research_losses(
     cfg: ProjectConfig,
     device: torch.device,
     research: M1ResearchSettings,
-) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+) -> tuple[
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+]:
     if clean_latents.shape != paired_latents.shape:
         raise ValueError("causal shape latent pairs must have identical shapes")
     if len(captions) != clean_latents.shape[0] or len(paired_captions) != len(captions):
@@ -975,6 +994,25 @@ def _causal_shape_research_losses(
     all_captions = [*captions, *paired_captions]
     tokens = components.tokenizer.batch(all_captions, cfg.text.max_length, device=device)
     text_tokens = components.text_encoder(tokens.input_ids, tokens.attention_mask)
+    projected_text = components.dit.text_proj(text_tokens)
+    first_text, second_text = projected_text.chunk(2, dim=0)
+    first_mask, second_mask = tokens.attention_mask.chunk(2, dim=0)
+    (
+        text_shape_loss,
+        text_shape_cosine,
+        text_shape_span_delta,
+        text_shape_global_ratio,
+    ) = shape_text_separation_loss(
+        first_text,
+        second_text,
+        first_mask,
+        second_mask,
+        captions,
+        paired_captions,
+        max_cosine=research.text_shape_max_cosine,
+        min_span_delta=research.text_shape_min_span_delta,
+        min_global_ratio=research.text_shape_min_global_ratio,
+    )
     predicted_noise = components.dit(
         torch.cat((noisy, noisy), dim=0),
         timesteps.repeat(2),
@@ -1028,6 +1066,7 @@ def _causal_shape_research_losses(
     total = (
         research.causal_shape_weight * causal_loss
         + research.latent_rank_weight * rank_loss
+        + research.text_shape_weight * text_shape_loss
         + research.sinkhorn_shape_weight * sinkhorn_gate * sinkhorn_loss
     )
     return (
@@ -1038,6 +1077,10 @@ def _causal_shape_research_losses(
         delta_cosine,
         magnitude_ratio,
         rank_margin,
+        text_shape_loss,
+        text_shape_cosine,
+        text_shape_span_delta,
+        text_shape_global_ratio,
         sinkhorn_margin,
         sinkhorn_gate,
     )
@@ -1195,6 +1238,10 @@ def diffusion_train_step(
     causal_shape_loss = latents.new_zeros(())
     latent_shape_rank_loss = latents.new_zeros(())
     latent_shape_rank_margin = latents.new_zeros(())
+    text_shape_loss = latents.new_zeros(())
+    text_shape_cosine = latents.new_zeros(())
+    text_shape_span_delta = latents.new_zeros(())
+    text_shape_global_ratio = latents.new_zeros(())
     sinkhorn_shape_loss = latents.new_zeros(())
     sinkhorn_shape_gate = latents.new_zeros(())
     latent_shape_delta_cosine = latents.new_zeros(())
@@ -1211,6 +1258,10 @@ def diffusion_train_step(
             latent_shape_delta_cosine,
             latent_shape_delta_magnitude_ratio,
             latent_shape_rank_margin,
+            text_shape_loss,
+            text_shape_cosine,
+            text_shape_span_delta,
+            text_shape_global_ratio,
             sinkhorn_shape_margin,
             sinkhorn_shape_gate,
         ) = _causal_shape_research_losses(
@@ -1323,6 +1374,10 @@ def diffusion_train_step(
         causal_shape_loss=float(causal_shape_loss.detach().item()),
         latent_shape_rank_loss=float(latent_shape_rank_loss.detach().item()),
         latent_shape_rank_margin=float(latent_shape_rank_margin.detach().item()),
+        text_shape_loss=float(text_shape_loss.detach().item()),
+        text_shape_cosine=float(text_shape_cosine.detach().item()),
+        text_shape_span_delta=float(text_shape_span_delta.detach().item()),
+        text_shape_global_ratio=float(text_shape_global_ratio.detach().item()),
         sinkhorn_shape_loss=float(sinkhorn_shape_loss.detach().item()),
         sinkhorn_shape_gate=float(sinkhorn_shape_gate.detach().item()),
         latent_shape_delta_cosine=float(latent_shape_delta_cosine.detach().item()),
@@ -1992,6 +2047,10 @@ def train_stage_b(
                 f"causal_shape={last_metrics.causal_shape_loss:.6f} "
                 f"latent_rank={last_metrics.latent_shape_rank_loss:.6f} "
                 f"latent_rank_margin={last_metrics.latent_shape_rank_margin:.6f} "
+                f"text_shape={last_metrics.text_shape_loss:.6f} "
+                f"text_shape_cos={last_metrics.text_shape_cosine:.6f} "
+                f"text_shape_span_delta={last_metrics.text_shape_span_delta:.6f} "
+                f"text_shape_global_ratio={last_metrics.text_shape_global_ratio:.6f} "
                 f"sinkhorn_shape={last_metrics.sinkhorn_shape_loss:.6f} "
                 f"sinkhorn_gate={last_metrics.sinkhorn_shape_gate:.6f} "
                 f"latent_shape_cos={last_metrics.latent_shape_delta_cosine:.6f} "

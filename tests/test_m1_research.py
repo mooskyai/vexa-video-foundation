@@ -14,6 +14,7 @@ from vexa_video.training.m1_research import (
     latent_target_ranking_loss,
     merge_primary_and_protected_gradients,
     min_snr_epsilon_weights,
+    shape_text_separation_loss,
     sinkhorn_causal_gate,
     sinkhorn_shape_geometry_loss,
 )
@@ -178,3 +179,63 @@ def test_sinkhorn_shape_geometry_prefers_matching_square() -> None:
     assert torch.isfinite(margin)
     assert float(margin.item()) > 0.0
     assert math.isfinite(float(loss.item()))
+
+
+def test_shape_text_separation_rejects_collapsed_projected_shape_tokens() -> None:
+    first_caption = "a red square moves right at medium speed"
+    second_caption = "a red circle moves right at medium speed"
+    sequence_length = len(first_caption.encode("utf-8")) + 2
+    first = torch.zeros((1, sequence_length, 4))
+    second = torch.zeros_like(first)
+    mask = torch.ones((1, sequence_length), dtype=torch.bool)
+
+    collapsed_loss, _, collapsed_delta, collapsed_global = shape_text_separation_loss(
+        first,
+        second,
+        mask,
+        mask,
+        [first_caption],
+        [second_caption],
+        max_cosine=0.25,
+        min_span_delta=0.35,
+        min_global_ratio=0.15,
+    )
+
+    square_start = first_caption.index("square") + 1
+    circle_start = second_caption.index("circle") + 1
+    first[:, square_start : square_start + 6, 0] = 1.0
+    second[:, circle_start : circle_start + 6, 0] = -1.0
+    separated_loss, cosine, separated_delta, separated_global = shape_text_separation_loss(
+        first,
+        second,
+        mask,
+        mask,
+        [first_caption],
+        [second_caption],
+        max_cosine=0.25,
+        min_span_delta=0.35,
+        min_global_ratio=0.15,
+    )
+
+    assert float(separated_loss.item()) < float(collapsed_loss.item())
+    assert float(cosine.item()) < 0.0
+    assert float(separated_delta.item()) > float(collapsed_delta.item())
+    assert float(separated_global.item()) > float(collapsed_global.item())
+
+
+def test_shape_text_separation_rejects_missing_shape_word() -> None:
+    tokens = torch.zeros((1, 16, 4))
+    mask = torch.ones((1, 16), dtype=torch.bool)
+
+    with pytest.raises(ValueError, match="exactly one shape word"):
+        shape_text_separation_loss(
+            tokens,
+            tokens,
+            mask,
+            mask,
+            ["a red object"],
+            ["a blue object"],
+            max_cosine=0.25,
+            min_span_delta=0.35,
+            min_global_ratio=0.15,
+        )

@@ -339,3 +339,18 @@ The release report must distinguish measured facts from interpretation.
 ### Stage-B-v5 corrective evidence
 
 The v4 frozen test result remained a failure: direction `0.156250`, color `0.781250`, mean motion `0.131964`, static rate `0.015625`. A separate validation-split sweep showed direction accuracy `1.0` at 4/6 steps, `0.953125` at 8, `0.421875` at 12, and near chance from 16 to 50. v5 must therefore preserve direction through the full 50-step path. Training periodically differentiates through 50 CFG-DDIM steps, and checkpoint selection includes 16 fixed validation-split 50-step generations. The final M1 gate is still the frozen 64-sample test protocol and M2 remains blocked.
+
+
+### M1 text-conditioning bottleneck correction
+
+The 300-step shape-conflict probe verified that protected gradient projection activates, but it did not close the causal shape gap: latent shape cosine stayed below `0.10`, Sinkhorn correctly remained gated off, and generated shape stayed at `0.500000`. The next controlled correction therefore targets the text-conditioning path rather than increasing geometry or ranking weights.
+
+The DiT keeps text as the only semantic control but replaces per-token normalization before pooling/attention with projection-driven token cross-attention and importance-weighted whole-caption pooling. A protected square/circle word-span loss is computed from the byte-token positions already present in the caption. It must:
+
+- reduce projected square/circle span cosine toward or below the configured maximum;
+- keep the relative projected span delta above the configured floor;
+- preserve a measurable whole-caption counterfactual delta so global conditioning cannot average the shape word away;
+- remain inside the shape-protected gradient-surgery branch;
+- leave the VAE, frozen evaluator, 50-step acceptance protocol, CFG guidance, and generation gates unchanged.
+
+For the next 300-step probe, inspect `text_shape`, `text_shape_cos`, `text_shape_span_delta`, `text_shape_global_ratio`, `latent_shape_cos`, `latent_shape_ratio`, `shape_grad_projected`, and `generated_shape` together. Do not extend the probe until the projected text separation improves and latent shape cosine shows a sustained response.
