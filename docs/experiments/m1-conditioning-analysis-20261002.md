@@ -432,3 +432,22 @@ two 16x4096 standard-normal matrices; 256 permutations with seed 7. The text con
 used alternating `[1,-1]` repeated 48 times, offsets +/-2, actual paired tokenizer masks,
 thresholds 0.25/0.35/0.15, and 256 random queries seeded 7. Float32 results may differ
 slightly with platform/runtime. None of these controls evaluates learned quality.
+
+
+## Diagnostic implementation follow-up
+
+The subsequent diagnostic-only patch implements the conditioning/dynamics measurements requested by
+this audit without selecting a training correction. `m1_shape_dynamics_decomposition.py` now includes
+exact `t=500` local probes in addition to the frozen sampler grid; square, circle, and midpoint noisy
+anchors; repeated noise seeds; deterministic alternate renderer positions; empirical latent power;
+direct epsilon, predicted-clean, and DDIM forcing responses; normalized consumed pool/attention traces;
+and read-only branch ablations. Reverse-step state feedback is split into the analytic `A * delta_x`
+transport term and the remaining model epsilon term, with algebraic residuals reported. Selected
+predicted-clean estimates are decoded with the frozen generated-video metrics instead of interpreting
+noisy intermediate states as clean geometry.
+
+The diagnostic forward is a parameter-free mirror of the current DiT and must match production within
+`1e-5` before branch-ablation results are accepted. This implementation still does not recover the
+deleted learned checkpoint, alter training, or establish that cross-attention, timestep-band
+supervision, positional encoding, or object-frame constraints are the correct remedy. Optimizer-level
+gradient/update diagnostics remain necessary if gradient conflict is reconsidered.

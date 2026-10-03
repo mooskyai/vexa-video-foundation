@@ -388,13 +388,21 @@ uv run python scripts/m1_shape_dynamics_decomposition.py `
   --config configs/tiny.toml `
   --checkpoint runs/m1-text-conditioning-probe/checkpoints/best.pt `
   --samples 16 `
+  --position-variants 2 `
+  --noise-seeds 3 `
   --permutations 256 `
   --output runs/m1-text-conditioning-probe/shape-dynamics-decomposition.json `
   --cuda
 ```
 
 This tool performs no optimizer step and does not modify the checkpoint, model architecture, VAE,
-CFG-DDIM sampler, evaluator, or frozen M1 gates. No additional package is required.
+CFG-DDIM sampler, evaluator, or frozen M1 gates. No additional package is required. The diagnostic
+mirror of `VideoDiT.forward` is checked against the production forward before branch ablations are
+accepted. The output now separates analytic DDIM state transport from model-dependent epsilon
+feedback, reports direct epsilon/predicted-clean/one-step forcing, includes exact `t=500`, repeats
+local square/circle/midpoint anchors across noise seeds and translated renderer positions, traces the
+normalized pool and first/final text-attention branches, and decodes selected predicted-clean states
+with the frozen generated-video measurements.
 
 ## M1 conditioning analysis before another correction
 
@@ -410,3 +418,10 @@ registered boundary effects, predicted-clean geometry with object validity, and 
 feedback separately from transport. Include exact training timestep 500 and empirical
 latent signal power. The deleted learned checkpoint has not been re-evaluated. This
 audit changes documentation only; M1 remains open and M2 remains blocked.
+
+
+The expanded diagnostic is still evidence gathering, not a model correction. In particular, branch
+ablations do not train replacement attention, local-response measurements do not change timestep
+sampling, and the output must not be used to lower M1 gates. Gradient-surgery interpretation at the
+actual AdamW update level remains a separate requirement if optimization conflict is reconsidered as
+the causal mechanism.

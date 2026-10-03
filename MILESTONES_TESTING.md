@@ -402,7 +402,15 @@ training correction is selected, its evidence must:
 - distinguish terminal-LayerNorm task-gradient diagnostics from whole-model surgery,
   and raw-gradient projection from the actual AdamW update.
 
-The current scripts do not yet provide all these controls. No correction is selected
-by the audit. Checkpoint-free controls establish metric limitations; they do not replace
-learned-checkpoint measurements or close M1. The 64-video TEST/50-step/CFG=3 acceptance
-protocol, frozen evaluator, all visual/control gates, and manual MP4 validation stand.
+The revised read-only dynamics diagnostic now covers the conditioning/dynamics controls above: it
+checks its mirrored DiT forward against production, traces normalized pool/attention consumption,
+uses square/circle/midpoint anchors across repeated noise and renderer-position variants, includes
+exact `t=500`, separates analytic DDIM transport from learned epsilon feedback, and decodes selected
+predicted-clean estimates with the frozen generated-video measurements.
+
+This does **not** select a correction. The historical task-gradient cosines are still restricted to
+the terminal LayerNorm, and raw gradient surgery still does not describe the actual AdamW update. If
+optimization conflict is reconsidered as the causal mechanism, per-module gradients and optimizer
+update direction must be measured before changing training. Learned-checkpoint evidence is still
+required, and the 64-video TEST/50-step/CFG=3 acceptance protocol, frozen evaluator, all visual/control
+gates, and manual MP4 validation stand.

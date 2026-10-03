@@ -127,3 +127,27 @@ def symmetric_two_factor_decomposition(
     )
     total = first_state_first_condition - second_state_second_condition
     return condition, state, total
+
+
+def ddim_linear_coefficients(
+    alpha_t: Tensor,
+    alpha_previous: Tensor | None,
+) -> tuple[Tensor, Tensor]:
+    """Return exact state/noise coefficients for the repository's deterministic DDIM step."""
+    if alpha_t.ndim != 0:
+        raise ValueError("alpha_t must be a scalar tensor")
+    if not bool(((alpha_t > 0.0) & (alpha_t <= 1.0)).item()):
+        raise ValueError("alpha_t must be in (0, 1]")
+
+    if alpha_previous is None:
+        state = alpha_t.rsqrt()
+        noise = -((1.0 - alpha_t) / alpha_t).sqrt()
+        return state, noise
+
+    if alpha_previous.ndim != 0:
+        raise ValueError("alpha_previous must be a scalar tensor")
+    if not bool(((alpha_previous > 0.0) & (alpha_previous <= 1.0)).item()):
+        raise ValueError("alpha_previous must be in (0, 1]")
+    state = (alpha_previous / alpha_t).sqrt()
+    noise = (1.0 - alpha_previous).sqrt() - state * (1.0 - alpha_t).sqrt()
+    return state, noise

@@ -294,3 +294,14 @@ checkpoint-free counterexamples and diagnostic requirements; it introduces no mo
 or training change. Per-block learned attention, adaLN, timestep-band supervision,
 and object-frame constraints remain conditional candidates pending matched learned
 response evidence. M1 remains open and M2 remains blocked.
+
+
+### M1 conditioning observability
+
+The read-only M1 dynamics tool mirrors the current `VideoDiT.forward` without adding parameters and
+requires numerical equivalence to the production forward when no branch is disabled. It can then
+ablate the existing pooled-text, first token-attention, and final token-attention branches one at a
+time. The diagnostic also decomposes each deterministic DDIM transition into analytic state transport,
+model-dependent state feedback, and direct condition forcing. These paths are observability only; the
+training graph, sampler, checkpoint schema, VAE, evaluator, and semantic text-only contract are
+unchanged.
