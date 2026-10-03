@@ -1,0 +1,88 @@
+{
+  "artifact_type": "M1 passing generated-video candidate",
+  "source_commit": "5886754",
+  "checkpoint_path": "artifacts/checkpoints/m1/m1-passing-candidate.pt",
+  "checkpoint_sha256": "b4fc55eb8331d158316882c6fa1187e80f9ce5e1a244114695b95382b7efc9cb",
+  "vae_checkpoint_sha256": "cbb3f85dd6fd50575402cbdcdb308bee7c81b90392420f838b144d87802942f6",
+  "vae_step": 800,
+  "diffusion_step": 12100,
+  "evaluation": {
+    "samples": 64,
+    "sampling_steps": 50,
+    "guidance_scale": 3.0,
+    "direction_accuracy": 1.0,
+    "color_accuracy": 1.0,
+    "shape_accuracy": 0.78125,
+    "mean_motion": 0.03558,
+    "static_rate": 0.0,
+    "object_like_frame_rate": 1.0,
+    "persistent_video_rate": 1.0,
+    "mean_foreground_area_ratio": 1.227271,
+    "gate_passed": true,
+    "direction_confusion": [
+      [
+        16,
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        16,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        16,
+        0
+      ],
+      [
+        0,
+        0,
+        0,
+        16
+      ]
+    ],
+    "color_confusion": [
+      [
+        16,
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        16,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        16,
+        0
+      ],
+      [
+        0,
+        0,
+        0,
+        16
+      ]
+    ],
+    "shape_confusion": [
+      [
+        21,
+        11
+      ],
+      [
+        3,
+        29
+      ]
+    ]
+  },
+  "status": "passing_candidate",
+  "note": "Passes frozen M1 64-sample 50-step gate. Shape remains close to threshold and biased toward circle predictions; diagnostic analysis and same-protocol random baseline remain required before declaring M1 closed.",
+  "created_utc": "2026-10-03T08:32:09.1390747Z"
+}
