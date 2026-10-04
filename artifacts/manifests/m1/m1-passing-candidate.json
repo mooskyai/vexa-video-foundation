@@ -84,5 +84,5 @@
   },
   "status": "passing_candidate",
   "note": "Passes frozen M1 64-sample 50-step gate. Shape remains close to threshold and biased toward circle predictions; diagnostic analysis and same-protocol random baseline remain required before declaring M1 closed.",
-  "created_utc": "2026-10-03T08:32:09.1390747Z"
+  "created_utc": "2026-10-04T03:51:34.9900426Z"
 }
