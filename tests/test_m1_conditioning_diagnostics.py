@@ -76,3 +76,42 @@ def test_disabling_all_text_branches_removes_text_dependence() -> None:
         )
 
     assert torch.allclose(first, second, atol=1e-6, rtol=1e-5)
+
+
+def test_first_attention_is_timestep_contextualized() -> None:
+    dit, latents, _, text, mask = _fixture()
+    early = torch.tensor([245, 245], dtype=torch.long)
+    semantic = torch.tensor([500, 500], dtype=torch.long)
+
+    with torch.no_grad():
+        _, early_trace = diagnostic_dit_forward(dit, latents, early, text, mask)
+        _, semantic_trace = diagnostic_dit_forward(dit, latents, semantic, text, mask)
+
+    assert not torch.allclose(
+        early_trace.first_attention,
+        semantic_trace.first_attention,
+        atol=1e-6,
+        rtol=1e-5,
+    )
+
+
+def test_final_attention_is_processed_by_final_transformer_block() -> None:
+    dit, latents, timesteps, text, mask = _fixture()
+    final_layer_inputs: list[torch.Tensor] = []
+
+    def capture_input(_module: torch.nn.Module, args: tuple[torch.Tensor, ...]) -> None:
+        final_layer_inputs.append(args[0].detach().clone())
+
+    handle = dit.blocks.layers[-1].register_forward_pre_hook(capture_input)
+    try:
+        with torch.no_grad():
+            enabled, _ = diagnostic_dit_forward(dit, latents, timesteps, text, mask)
+            disabled, _ = diagnostic_dit_forward(
+                dit, latents, timesteps, text, mask, disable_final_attention=True
+            )
+    finally:
+        handle.remove()
+
+    assert len(final_layer_inputs) == 2
+    assert not torch.allclose(final_layer_inputs[0], final_layer_inputs[1])
+    assert not torch.allclose(enabled, disabled)

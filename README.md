@@ -304,6 +304,30 @@ uv run python scripts/m1_optuna.py `
 
 `geomloss==0.3.1` is the only new research runtime dependency used by this path; Optuna is a development dependency. Kornia, MONAI, LibMTL, and TorchOpt are intentionally not required.
 
+### Spatial text-routing correction
+
+The first full 13,000-step learned baseline from the frozen, independently passing VAE produced a
+quantitatively passing M1 checkpoint at diffusion step 12,100. On the frozen 64-video/50-step test
+it reached direction `1.000000`, color `1.000000`, shape `0.781250`, static rate `0.000000`,
+object-like frame rate `1.000000`, persistence `1.000000`, and foreground-area ratio `1.227271`.
+Manual MP4 review nevertheless showed that a prompt requesting a square could still produce a
+rounded, blob-like silhouette. The frozen fill-ratio evaluator can classify such a foreground as a
+square when it fills enough of its bounding box, so the passing checkpoint remains research evidence
+rather than proof of crisp boundary geometry.
+
+The next correction is deliberately architecture-local and checkpoint-compatible. It does not add
+parameters or change the VAE, dataset, CFG-DDIM sampler, losses, or frozen M1 thresholds. The first
+token/text attention now queries a state that already contains spatial position, timestep and pooled
+text context. The second token/text attention is injected before the final Transformer block rather
+than after all Transformer processing, leaving a learned self-attention/MLP stage that can convert
+the final text response into local boundary structure. Existing VAE-ready checkpoints remain
+load-compatible because the parameter set and tensor shapes are unchanged.
+
+Train this correction only from the frozen VAE-ready checkpoint at `diffusion_step=0`; do not resume
+the previously learned diffusion candidate. Preserve that candidate and its metrics as baseline
+evidence for the routing experiment. M2 remains blocked until generated square/circle geometry is
+visually convincing across multiple seeds in addition to passing the frozen quantitative gate.
+
 ## M1 causal shape diagnostics
 
 Before another M1 correction, run the read-only square/circle causal scan against an existing

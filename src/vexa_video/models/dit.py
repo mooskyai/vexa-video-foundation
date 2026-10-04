@@ -166,11 +166,29 @@ class VideoDiT(nn.Module):
         time_cond = self.time_mlp(timestep_embedding(timesteps, tokens.shape[-1])).unsqueeze(1)
         projected_text = self.text_proj(text_tokens)
         text_cond = importance_weighted_text_pool(projected_text, text_mask).unsqueeze(1)
-        token_cond = token_text_attention(tokens, projected_text, text_mask)
-        tokens = tokens + positions + time_cond + text_cond + token_cond
-        tokens = self.blocks(tokens)
-        tokens = tokens + token_text_attention(tokens, projected_text, text_mask)
-        tokens = self.out(self.norm(tokens))
+
+        # Shape words need to bind to spatial tokens, not only to raw patch content.
+        # Build the query state from patch + position + timestep + global text first,
+        # then apply token-level text attention so its routing can depend on where and
+        # when a patch exists in the denoising trajectory.
+        hidden = tokens + positions + time_cond + text_cond
+        hidden = hidden + token_text_attention(hidden, projected_text, text_mask)
+
+        # The second text injection used to happen after every Transformer block,
+        # immediately before the output projection. That gave the model no spatial
+        # processing stage in which to turn the final text response into boundary
+        # geometry. Inject it before the final block instead, so the last self-attn/
+        # MLP stage can propagate and refine text-conditioned local structure.
+        layers = self.blocks.layers
+        if len(layers) == 0:
+            raise RuntimeError("VideoDiT requires at least one Transformer block")
+        for block in layers[:-1]:
+            hidden = block(hidden)
+        hidden = hidden + token_text_attention(hidden, projected_text, text_mask)
+        hidden = layers[-1](hidden)
+        if self.blocks.norm is not None:
+            hidden = self.blocks.norm(hidden)
+        tokens = self.out(self.norm(hidden))
 
         tokens = tokens.view(batch, grid[0], grid[1], grid[2], channels, pt, ph, pw)
         tokens = tokens.permute(0, 4, 1, 5, 2, 6, 3, 7).contiguous()

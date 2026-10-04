@@ -134,18 +134,30 @@ def diagnostic_dit_forward(
     time_cond = dit.time_mlp(timestep_embedding(timesteps, tokens.shape[-1])).unsqueeze(1)
     projected_text = dit.text_proj(text_tokens)
     pooled = importance_weighted_text_pool(projected_text, text_mask).unsqueeze(1)
-    first = _attention_trace(tokens, projected_text, text_mask, shape_token_mask)
 
     hidden = tokens + positions + time_cond
     if not disable_pool:
         hidden = hidden + pooled
+
+    # Production queries the first text-attention branch only after spatial,
+    # timestep and pooled-text context are present.
+    first = _attention_trace(hidden, projected_text, text_mask, shape_token_mask)
     if not disable_first_attention:
         hidden = hidden + first.output
-    hidden = dit.blocks(hidden)
 
+    # Mirror production's final text injection before the final Transformer
+    # block, leaving one learned spatial processing stage after conditioning.
+    layers = dit.blocks.layers
+    if len(layers) == 0:
+        raise RuntimeError("VideoDiT requires at least one Transformer block")
+    for block in layers[:-1]:
+        hidden = block(hidden)
     final = _attention_trace(hidden, projected_text, text_mask, shape_token_mask)
     if not disable_final_attention:
         hidden = hidden + final.output
+    hidden = layers[-1](hidden)
+    if dit.blocks.norm is not None:
+        hidden = dit.blocks.norm(hidden)
     hidden = dit.out(dit.norm(hidden))
 
     hidden = hidden.view(batch, grid[0], grid[1], grid[2], channels, pt, ph, pw)
