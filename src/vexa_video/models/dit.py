@@ -95,6 +95,73 @@ def importance_weighted_text_pool(text_tokens: Tensor, text_mask: Tensor) -> Ten
     return F.layer_norm(pooled, (pooled.shape[-1],))
 
 
+class GatedTextCrossAttention(nn.Module):
+    """Learned text cross-attention with Q/K RMS normalization and a gentle residual gate."""
+
+    def __init__(self, hidden_size: int, heads: int, *, gate_init: float = 0.05) -> None:
+        super().__init__()
+        if hidden_size % heads != 0:
+            raise ValueError("hidden_size must be divisible by heads")
+        if not 0.0 < gate_init < 1.0:
+            raise ValueError("gate_init must be in (0, 1)")
+        self.hidden_size = hidden_size
+        self.heads = heads
+        self.head_dim = hidden_size // heads
+        self.query_norm = nn.LayerNorm(hidden_size)
+        self.text_norm = nn.LayerNorm(hidden_size)
+        self.q_proj = nn.Linear(hidden_size, hidden_size)
+        self.k_proj = nn.Linear(hidden_size, hidden_size)
+        self.v_proj = nn.Linear(hidden_size, hidden_size)
+        self.out_proj = nn.Linear(hidden_size, hidden_size)
+        gate_logit = math.log(gate_init / (1.0 - gate_init))
+        self.gate_logit = nn.Parameter(torch.tensor(gate_logit, dtype=torch.float32))
+
+    def _split_heads(self, tensor: Tensor) -> Tensor:
+        batch, tokens, _ = tensor.shape
+        return tensor.view(batch, tokens, self.heads, self.head_dim).transpose(1, 2)
+
+    @staticmethod
+    def _rms_unit(tensor: Tensor, eps: float = 1e-6) -> Tensor:
+        scale = torch.rsqrt(tensor.square().mean(dim=-1, keepdim=True) + eps)
+        return tensor * scale
+
+    def normalized_qk(self, video_tokens: Tensor, text_tokens: Tensor) -> tuple[Tensor, Tensor]:
+        query = self._split_heads(self.q_proj(self.query_norm(video_tokens)))
+        key = self._split_heads(self.k_proj(self.text_norm(text_tokens)))
+        return self._rms_unit(query), self._rms_unit(key)
+
+    def forward(self, video_tokens: Tensor, text_tokens: Tensor, text_mask: Tensor) -> Tensor:
+        if video_tokens.ndim != 3 or text_tokens.ndim != 3:
+            raise ValueError("video_tokens and text_tokens must be rank-3 tensors")
+        if text_mask.shape != text_tokens.shape[:2]:
+            raise ValueError("text_mask must have shape [B, L]")
+        if video_tokens.shape[0] != text_tokens.shape[0]:
+            raise ValueError("video/text batch sizes must match")
+        if video_tokens.shape[-1] != self.hidden_size or text_tokens.shape[-1] != self.hidden_size:
+            raise ValueError("cross-attention feature dimensions must match hidden_size")
+        if not bool(text_mask.any(dim=1).all().item()):
+            raise ValueError("every text sequence must contain at least one unmasked token")
+
+        query, key = self.normalized_qk(video_tokens, text_tokens)
+        value = self._split_heads(self.v_proj(self.text_norm(text_tokens)))
+        allowed = text_mask[:, None, None, :]
+        attended = F.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=allowed,
+            dropout_p=0.0,
+            is_causal=False,
+        )
+        attended = (
+            attended.transpose(1, 2)
+            .contiguous()
+            .view(video_tokens.shape[0], video_tokens.shape[1], self.hidden_size)
+        )
+        gate = torch.sigmoid(self.gate_logit).to(dtype=attended.dtype)
+        return cast(Tensor, gate * self.out_proj(attended))
+
+
 class VideoDiT(nn.Module):
     def __init__(
         self,
@@ -134,6 +201,9 @@ class VideoDiT(nn.Module):
             nn.Linear(hidden_size * 4, hidden_size),
         )
         self.text_proj = nn.Linear(text_dim, hidden_size)
+        self.text_cross_attention = nn.ModuleList(
+            GatedTextCrossAttention(hidden_size, heads) for _ in range(layers)
+        )
         patch_volume = math.prod(patch_size)
         self.out = nn.Linear(hidden_size, latent_channels * patch_volume)
         self.norm = nn.LayerNorm(hidden_size)
@@ -167,25 +237,20 @@ class VideoDiT(nn.Module):
         projected_text = self.text_proj(text_tokens)
         text_cond = importance_weighted_text_pool(projected_text, text_mask).unsqueeze(1)
 
-        # Shape words need to bind to spatial tokens, not only to raw patch content.
-        # Build the query state from patch + position + timestep + global text first,
-        # then apply token-level text attention so its routing can depend on where and
-        # when a patch exists in the denoising trajectory.
+        # Keep pooled text as the global control path for color/direction, then use
+        # learned token-level cross-attention before every spatial Transformer block.
+        # Q/K RMS normalization keeps logits controlled while SDPA can dispatch to
+        # fused CUDA kernels; the small learned gate prevents a random local branch
+        # from overwhelming the global path at the start of diffusion training.
         hidden = tokens + positions + time_cond + text_cond
-        hidden = hidden + token_text_attention(hidden, projected_text, text_mask)
-
-        # The second text injection used to happen after every Transformer block,
-        # immediately before the output projection. That gave the model no spatial
-        # processing stage in which to turn the final text response into boundary
-        # geometry. Inject it before the final block instead, so the last self-attn/
-        # MLP stage can propagate and refine text-conditioned local structure.
         layers = self.blocks.layers
         if len(layers) == 0:
             raise RuntimeError("VideoDiT requires at least one Transformer block")
-        for block in layers[:-1]:
+        if len(layers) != len(self.text_cross_attention):
+            raise RuntimeError("Transformer/cross-attention layer counts must match")
+        for block, cross_attention in zip(layers, self.text_cross_attention, strict=True):
+            hidden = hidden + cross_attention(hidden, projected_text, text_mask)
             hidden = block(hidden)
-        hidden = hidden + token_text_attention(hidden, projected_text, text_mask)
-        hidden = layers[-1](hidden)
         if self.blocks.norm is not None:
             hidden = self.blocks.norm(hidden)
         tokens = self.out(self.norm(hidden))

@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from vexa_video.models.dit import (
+    GatedTextCrossAttention,
     VideoDiT,
     importance_weighted_text_pool,
     spatiotemporal_position_embedding,
@@ -92,6 +93,48 @@ def _attention_trace(
     )
 
 
+def _learned_attention_trace(
+    attention: GatedTextCrossAttention,
+    video_tokens: Tensor,
+    text_tokens: Tensor,
+    text_mask: Tensor,
+    shape_token_mask: Tensor | None,
+) -> AttentionTrace:
+    output = attention(video_tokens, text_tokens, text_mask)
+    query, key = attention.normalized_qk(video_tokens, text_tokens)
+    scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(attention.head_dim)
+    valid = text_mask[:, None, None, :]
+    masked_scores = scores.masked_fill(~valid, torch.finfo(scores.dtype).min)
+    weights = torch.softmax(masked_scores, dim=-1)
+
+    valid_float = valid.to(dtype=scores.dtype)
+    valid_count = valid_float.sum(dim=-1).clamp_min(1.0)
+    mean = (scores * valid_float).sum(dim=-1) / valid_count
+    centered = (scores - mean.unsqueeze(-1)) * valid_float
+    logit_std = (centered.square().sum(dim=-1) / valid_count).sqrt().mean(dim=(1, 2))
+
+    entropy = -(weights * weights.clamp_min(torch.finfo(weights.dtype).tiny).log()).sum(dim=-1)
+    entropy_denominator = text_mask.sum(dim=-1).to(dtype=entropy.dtype).clamp_min(2.0).log()
+    normalized_entropy = (entropy / entropy_denominator[:, None, None]).mean(dim=(1, 2))
+
+    if shape_token_mask is None:
+        shape_mass = torch.zeros(
+            (video_tokens.shape[0],),
+            device=video_tokens.device,
+            dtype=video_tokens.dtype,
+        )
+    else:
+        effective_shape_mask = (shape_token_mask & text_mask).to(dtype=weights.dtype)
+        shape_mass = (weights * effective_shape_mask[:, None, None, :]).sum(dim=-1).mean(dim=(1, 2))
+
+    return AttentionTrace(
+        output=output,
+        normalized_entropy=normalized_entropy,
+        shape_token_mass=shape_mass,
+        valid_logit_std=logit_std,
+    )
+
+
 def diagnostic_dit_forward(
     dit: VideoDiT,
     latents: Tensor,
@@ -139,23 +182,36 @@ def diagnostic_dit_forward(
     if not disable_pool:
         hidden = hidden + pooled
 
-    # Production queries the first text-attention branch only after spatial,
-    # timestep and pooled-text context are present.
-    first = _attention_trace(hidden, projected_text, text_mask, shape_token_mask)
-    if not disable_first_attention:
-        hidden = hidden + first.output
-
-    # Mirror production's final text injection before the final Transformer
-    # block, leaving one learned spatial processing stage after conditioning.
     layers = dit.blocks.layers
+    cross_layers = dit.text_cross_attention
     if len(layers) == 0:
         raise RuntimeError("VideoDiT requires at least one Transformer block")
-    for block in layers[:-1]:
+    if len(layers) != len(cross_layers):
+        raise RuntimeError("Transformer/cross-attention layer counts must match")
+
+    first: AttentionTrace | None = None
+    final: AttentionTrace | None = None
+    disable_all_cross = disable_first_attention and disable_final_attention
+    for index, (block, cross_attention) in enumerate(zip(layers, cross_layers, strict=True)):
+        typed_cross_attention = cast(GatedTextCrossAttention, cross_attention)
+        trace = _learned_attention_trace(
+            typed_cross_attention, hidden, projected_text, text_mask, shape_token_mask
+        )
+        if index == 0:
+            first = trace
+        if index == len(layers) - 1:
+            final = trace
+        disabled = (
+            disable_all_cross
+            or (index == 0 and disable_first_attention)
+            or (index == len(layers) - 1 and disable_final_attention)
+        )
+        if not disabled:
+            hidden = hidden + trace.output
         hidden = block(hidden)
-    final = _attention_trace(hidden, projected_text, text_mask, shape_token_mask)
-    if not disable_final_attention:
-        hidden = hidden + final.output
-    hidden = layers[-1](hidden)
+
+    if first is None or final is None:
+        raise RuntimeError("conditioning traces were not produced")
     if dit.blocks.norm is not None:
         hidden = dit.blocks.norm(hidden)
     hidden = dit.out(dit.norm(hidden))

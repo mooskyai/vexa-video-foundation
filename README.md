@@ -328,6 +328,46 @@ the previously learned diffusion candidate. Preserve that candidate and its metr
 evidence for the routing experiment. M2 remains blocked until generated square/circle geometry is
 visually convincing across multiple seeds in addition to passing the frozen quantitative gate.
 
+### Learned gated cross-attention correction
+
+The 300-step spatial-routing probe showed that reordering the parameter-free dot-product attention was
+not sufficient: projected square/circle text remained well separated (`text_shape_span_delta` about
+`1.25`), while the causal latent response stayed near zero (`latent_shape_cos=0.031820`) and generated
+shape remained at chance. The next correction therefore keeps pooled text conditioning for global
+color/direction control but replaces the parameter-free local route with learned multi-head
+cross-attention before every DiT Transformer block. Queries and keys use per-head RMS normalization,
+and each cross-attention residual begins behind a small learned sigmoid gate (`0.05`) so the new local
+path cannot dominate training before it has learned useful routing. PyTorch scaled-dot-product
+attention is used so CUDA can select a fused attention kernel when supported.
+
+Because learned cross-attention introduces new DiT parameters, first migrate the frozen VAE-ready
+checkpoint while preserving its VAE, text encoder, compatible legacy DiT initialization, RNG state,
+and data-generator state. Only the new cross-attention parameters are freshly initialized:
+
+```powershell
+uv run python scripts/m1_prepare_cross_attention_init.py `
+  --config configs/tiny.toml `
+  --source artifacts/checkpoints/m1/vae-ready.pt `
+  --output artifacts/checkpoints/m1/vae-ready-cross-attn.pt
+```
+
+Then run a 300-step probe before any full diffusion run:
+
+```powershell
+uv run vexa-video train `
+  --config configs/tiny.toml `
+  --run-dir runs/m1-learned-cross-attn-probe `
+  --resume artifacts/checkpoints/m1/vae-ready-cross-attn.pt `
+  --steps 300 `
+  --cuda
+```
+
+The probe must improve the causal route before a full run is justified. In particular, require
+`latent_shape_cos > 0.10` as the first routing threshold, keep `latent_shape_ratio` in a useful range,
+and verify that direction/color begin recovering rather than remaining at chance. The frozen VAE,
+dataset semantics, CFG-DDIM sampler, shape objectives, evaluator, and M1 acceptance thresholds remain
+unchanged.
+
 ## M1 causal shape diagnostics
 
 Before another M1 correction, run the read-only square/circle causal scan against an existing

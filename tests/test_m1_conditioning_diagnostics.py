@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from vexa_video.models.dit import VideoDiT
+from vexa_video.models.dit import GatedTextCrossAttention, VideoDiT
 from vexa_video.training.m1_conditioning_diagnostics import diagnostic_dit_forward
 
 
@@ -115,3 +115,38 @@ def test_final_attention_is_processed_by_final_transformer_block() -> None:
     assert len(final_layer_inputs) == 2
     assert not torch.allclose(final_layer_inputs[0], final_layer_inputs[1])
     assert not torch.allclose(enabled, disabled)
+
+
+def test_learned_cross_attention_ignores_masked_text_tokens() -> None:
+    torch.manual_seed(11)
+    attention = GatedTextCrossAttention(hidden_size=48, heads=4).eval()
+    video = torch.randn(2, 16, 48)
+    text = torch.randn(2, 8, 48)
+    mask = torch.tensor([[1, 1, 1, 0, 0, 0, 0, 0], [1, 1, 1, 1, 0, 0, 0, 0]], dtype=torch.bool)
+    changed = text.clone()
+    changed[~mask] = torch.randn_like(changed[~mask]) * 100.0
+
+    with torch.no_grad():
+        expected = attention(video, text, mask)
+        actual = attention(video, changed, mask)
+
+    assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-5)
+
+
+def test_learned_cross_attention_has_small_nonzero_gate_and_gradients() -> None:
+    torch.manual_seed(13)
+    attention = GatedTextCrossAttention(hidden_size=48, heads=4)
+    video = torch.randn(2, 16, 48, requires_grad=True)
+    text = torch.randn(2, 8, 48, requires_grad=True)
+    mask = torch.ones(2, 8, dtype=torch.bool)
+
+    output = attention(video, text, mask)
+    output.square().mean().backward()
+
+    gate = torch.sigmoid(attention.gate_logit).item()
+    assert 0.0 < gate < 0.1
+    assert attention.q_proj.weight.grad is not None
+    assert attention.k_proj.weight.grad is not None
+    assert attention.v_proj.weight.grad is not None
+    assert attention.out_proj.weight.grad is not None
+    assert attention.gate_logit.grad is not None
